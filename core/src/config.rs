@@ -22,7 +22,7 @@ pub struct Config {
     pub pool: Vec<String>,
     pub name_tables: BTreeMap<String, Vec<String>>,
     pub extra_breakable: Vec<String>,
-    /// `[horizon] max-bots`: the most bots at once (spawns past it are refused).
+    /// `[horizon] max-bots`: the most bots at once (spawns past it are refused); 0 = no limit.
     pub max_bots: u32,
     /// `[horizon] bot-view-distance`: the view distance a bot asks the server for, in chunks.
     pub bot_view_distance: u8,
@@ -30,7 +30,7 @@ pub struct Config {
     pub joins_per_tick: u32,
 }
 
-pub const DEFAULT_MAX_BOTS: u32 = 1000;
+pub const DEFAULT_MAX_BOTS: u32 = 0;
 pub const DEFAULT_BOT_VIEW_DISTANCE: u8 = 2;
 pub const DEFAULT_JOINS_PER_TICK: u32 = 5;
 
@@ -100,7 +100,7 @@ impl Config {
         }
         if let Some(h) = root.get("horizon").and_then(|v| v.as_table()) {
             if let Some(n) = h.get("max-bots").and_then(|v| v.as_integer()) {
-                c.max_bots = n.clamp(1, 10_000) as u32;
+                c.max_bots = n.clamp(0, u32::MAX as i64) as u32;
             }
             if let Some(n) = h.get("bot-view-distance").and_then(|v| v.as_integer()) {
                 c.bot_view_distance = n.clamp(2, 32) as u8;

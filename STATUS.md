@@ -162,7 +162,7 @@ nothing yet. Every line is untested on a server.
 
 Written, untested on a server (the glue and the Horizon patch have not been built):
 
-- `[horizon] max-bots` (1000) caps the bots; `bot-view-distance` (2) is the view distance a bot asks for.
+- `[horizon] max-bots` caps the bots (0 = no limit, the default); `bot-view-distance` (2) is the view distance a bot asks for.
 - Bots are marked fake players on the server (`native_set_player_fake`, a local Horizon patch, `docs` of the
   PR notes): they hold a 3x3 ticket and a small loaded area, and do not anchor natural mob spawning.
 - The glue gives each bot indices into one shared list of what it perceives (all players, mobs within reach),
