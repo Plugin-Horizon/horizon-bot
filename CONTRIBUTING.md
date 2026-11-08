@@ -1,4 +1,4 @@
-# Contributing to horizon-pvpbot
+# Contributing to HorizonBot
 
 Pull requests and improvements are always welcome! Bug reports, ideas and documentation fixes count just as much as code.
 
