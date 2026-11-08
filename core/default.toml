@@ -11,8 +11,8 @@ language = "en"
 
 # Switches of the Horizon integration.
 [horizon]
-# The most bots at once; a spawn past it is cut short or refused.
-max-bots = 1000  # 1 to 10000
+# The most bots at once; a spawn past it is cut short or refused. 0 = no limit.
+max-bots = 0  # 0 (no limit) or 1 and up
 # The view distance a bot asks the server for, in chunks. A bot reads no chunks, so the smaller the cheaper
 # (it is sent, tracks and keeps loaded only this much around it). 2 is the least the server allows.
 bot-view-distance = 2  # 2 to 32

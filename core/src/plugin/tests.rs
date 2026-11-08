@@ -359,10 +359,20 @@ fn max_bots_caps_spawns() {
 }
 
 #[test]
+fn max_bots_zero_means_no_limit() {
+    let mut p = plugin();
+    p.config.max_bots = 0;
+    assert_eq!(spawned(&p.command(&op(), "spawn 1500")).len(), 1500);
+    let e = p.command(&op(), "spawn Extra");
+    assert_eq!(spawned(&e).len(), 1);
+    assert!(!told(&e).contains("Bot limit"), "{}", told(&e));
+}
+
+#[test]
 fn horizon_section_is_read() {
     let c = crate::config::Config::parse("[horizon]\nmax-bots = 12\nbot-view-distance = 1\n").unwrap();
     assert_eq!((c.max_bots, c.bot_view_distance), (12, 2));
-    assert_eq!(crate::config::Config::parse(crate::config::DEFAULT_TOML).unwrap().max_bots, 1000);
+    assert_eq!(crate::config::Config::parse(crate::config::DEFAULT_TOML).unwrap().max_bots, 0);
     assert_eq!(crate::config::Config::parse(crate::config::DEFAULT_TOML).unwrap().joins_per_tick, 5);
     assert_eq!(crate::config::Config::parse("[horizon]\njoins-per-tick = 9\n").unwrap().joins_per_tick, 9);
 }

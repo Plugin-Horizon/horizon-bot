@@ -397,7 +397,7 @@ impl Plugin {
     #[allow(clippy::too_many_arguments)]
     fn add_live(&mut self, name: &str, world: &str, pos: Vec3, yaw: f32, skin_from: Option<String>, skin: SkinSource, out: &mut Vec<Effect>) {
         // `[horizon] max-bots` also holds for relogs and companions.
-        if self.bots.len() >= self.config.max_bots as usize && !self.bots.contains_key(&name.to_ascii_lowercase()) {
+        if self.config.max_bots != 0 && self.bots.len() >= self.config.max_bots as usize && !self.bots.contains_key(&name.to_ascii_lowercase()) {
             return;
         }
         let uuid = crate::uuid::offline(name);
@@ -1090,7 +1090,7 @@ impl Plugin {
             }
         };
         // `[horizon] max-bots`: only as many as fit under the cap.
-        let room = (self.config.max_bots as usize).saturating_sub(self.bots.len());
+        let room = if self.config.max_bots == 0 { usize::MAX } else { (self.config.max_bots as usize).saturating_sub(self.bots.len()) };
         if names.len() > room {
             let asked = names.len();
             names.truncate(room);
