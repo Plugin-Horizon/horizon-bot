@@ -1,0 +1,231 @@
+[mod]
+id = "horizonbot"
+version = "0.1.0"
+priority = 0
+
+# Written against this Horizon commit, blind (no build yet): see STATUS.md.
+[compatibility]
+horizon_revision = "b13dbf0687b545431172466ab4b91d19c3976405"
+
+# Settings, data files, commands, factions, kits, scripts, ghosts and the bots' brain and
+# physics: no engine types, tested on its own (`cargo test` in core/). Linked into the lib, so the
+# lib-side hooks (chat, the anticheat) reach it; the game side through `horizon_client::horizonbot::core`.
+[[crate]]
+id = "core"
+path = "core"
+dependent = "horizon-client-lib"
+
+# The shared state and the bots' connections (a `Joined` per bot on the network threads'
+# event channel, a test channel as its socket): `horizon_client::horizonbot`.
+[[module]]
+id = "lib"
+file = "crates/horizon-client/src/client_lib.rs"
+name = "horizonbot"
+source = "helpers/horizonbot_lib.rs"
+visibility = "pub"
+
+# The game side: perception, the brains' turn per level, packets, effects: `game::horizonbot_glue`.
+[[module]]
+id = "glue"
+file = "crates/horizon-client/src/game.rs"
+name = "horizonbot_glue"
+source = "helpers/glue.rs"
+
+[[injection]]
+id = "register-configs"
+hook = "register_configs"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/h_register_configs.rs"
+bindings = [
+  { name = "configs", ty = "&mut Vec<crate::game::native_configs::NativeConfig>", value = "&mut *configs" },
+]
+
+[[injection]]
+id = "config-loading"
+hook = "config_loading"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/h_config_loading.rs"
+bindings = [
+  { name = "config", ty = "&crate::game::native_configs::NativeConfigFile", value = "config" },
+]
+
+[[injection]]
+id = "config-reloading"
+hook = "config_reloading"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/h_config_reloading.rs"
+bindings = [
+  { name = "config", ty = "&crate::game::native_configs::NativeConfigFile", value = "config" },
+]
+
+[[injection]]
+id = "register-commands"
+hook = "register_commands"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/h_register_commands.rs"
+bindings = [
+  { name = "commands", ty = "&mut Vec<horizon_client::mod_api::NativeCommand>", value = "&mut *commands" },
+]
+
+[[injection]]
+id = "perform-command"
+hook = "perform_command"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/h_perform_command.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "player", ty = "&horizon_client::mod_api::NativeServerPlayer", value = "player" },
+  { name = "command", ty = "&str", value = "command" },
+  { name = "ran", ty = "&mut bool", value = "&mut *ran" },
+]
+
+[[injection]]
+id = "server-tick"
+hook = "server_tick"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/h_server_tick.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "phase", ty = "&horizon_client::mod_api::ServerTickPhase", value = "&phase" },
+]
+
+# Mobs and blocks are readable only with their level in place: the bots of a level think here.
+[[injection]]
+id = "level-tick"
+hook = "level_tick_pre"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/h_level_tick.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "dimension", ty = "&str", value = "dimension" },
+]
+
+[[injection]]
+id = "damage"
+hook = "living_incoming_damage"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/h_damage.rs"
+bindings = [
+  { name = "entity", ty = "i32", value = "entity" },
+  { name = "causing", ty = "i32", value = "causing" },
+  { name = "amount", ty = "f32", value = "*amount" },
+  { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
+
+[[injection]]
+id = "damage-after"
+hook = "living_incoming_damage"
+hook_version = 1
+kind = "RETURN"
+helper = "helpers/h_damage_after.rs"
+bindings = [
+  { name = "value", ty = "()", value = "$value" },
+  { name = "entity", ty = "i32", value = "entity" },
+  { name = "causing", ty = "i32", value = "causing" },
+  { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
+
+[[injection]]
+id = "player-died"
+hook = "player_died"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/h_player_died.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "player", ty = "u128", value = "player" },
+]
+
+[[injection]]
+id = "logged-in"
+hook = "player_logged_in"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/h_logged_in.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "player", ty = "u128", value = "player" },
+  { name = "name", ty = "&str", value = "name" },
+]
+
+[[injection]]
+id = "logged-out"
+hook = "player_logged_out"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/h_logged_out.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "player", ty = "u128", value = "player" },
+  { name = "name", ty = "&str", value = "name" },
+]
+
+[[injection]]
+id = "stopping"
+hook = "server_stopping"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/h_stopping.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+]
+
+# HorizonBot's menus (chest screens a stock client shows).
+[[injection]]
+id = "menu-clicked"
+hook = "menu_clicked"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/h_menu_clicked.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "uuid", ty = "u128", value = "uuid" },
+  { name = "slot", ty = "i32", value = "slot" },
+  { name = "button", ty = "i32", value = "button" },
+]
+
+[[injection]]
+id = "menu-closed"
+hook = "menu_closed"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/h_menu_closed.rs"
+bindings = [
+  { name = "uuid", ty = "u128", value = "uuid" },
+]
+
+# Lib side: a companion's owner orders in chat.
+[[injection]]
+id = "player-chat"
+hook = "player_chat"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/h_player_chat.rs"
+bindings = [
+  { name = "player", ty = "u128", value = "player" },
+  { name = "name", ty = "&str", value = "name" },
+  { name = "message", ty = "&str", value = "message" },
+  { name = "replies", ty = "&mut Vec<crate::text::Text>", value = "&mut *replies" },
+  { name = "cancel", ty = "&mut bool", value = "&mut *cancel" },
+]
+
+# GAP (GAPS.md): no hook exempts a player from the anticheat. A raw target, not in the catalog:
+# the anticheat's flag with a setback (`lan/anticheat.rs`), skipped for bots.
+[[injection]]
+id = "skip-anticheat"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::lan::anticheat::Hub::flag_to"
+helper = "helpers/h_anticheat.rs"
+bindings = [
+  { name = "hub", ty = "&crate::lan::hub::Hub", value = "&*self" },
+  { name = "i", ty = "usize", value = "i" },
+]

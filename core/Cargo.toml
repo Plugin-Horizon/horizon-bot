@@ -1,0 +1,11 @@
+[package]
+name = "horizonbot-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "PvP fighter bots for Horizon: settings, data files, commands and the bot AI, independent of the engine"
+
+[dependencies]
+# Only crates already in Horizon's Cargo.lock (a589a3dd9).
+toml = "=1.1.6"
+toml_edit = "=0.25.15"

@@ -1,0 +1,532 @@
+# HorizonBot: every behaviour setting, with its default.
+# /horizonbot set <name> <value> writes here and keeps these comments.
+# Values outside their limits are clamped. Saving the file reloads it.
+
+# The active preset (empty = none). Presets layer over the values above, faction settings over presets.
+active-preset = ""
+
+[plugin]
+# Only English messages ship; change single lines in config/horizonbot/messages.yml.
+language = "en"
+
+# Switches of the Horizon integration.
+[horizon]
+# The most bots at once; a spawn past it is cut short or refused.
+max-bots = 1000  # 1 to 10000
+# The view distance a bot asks the server for, in chunks. A bot reads no chunks, so the smaller the cheaper
+# (it is sent, tracks and keeps loaded only this much around it). 2 is the least the server allows.
+bot-view-distance = 2  # 2 to 32
+# The most bots let in per server tick; a big spawn trickles in instead of lagging one tick.
+joins-per-tick = 5  # 1 to 1000
+
+# Periodic checks, restarts, compatibility.
+[general]
+check-interval = 16  # 1 to 200
+bots-relog = true
+force-vulnerable = true
+auth-autologin = true
+bypass-damage-protection = false
+target-scan-interval = 12  # 1 to 60
+drop-items = true
+
+# Who a bot fights, how hard, and the special moves. Health is in half-hearts (20 = full), times in ticks.
+[combat]
+auto-target = true
+target-players = true
+target-passive-mobs = false
+revenge = true
+friendly-fire = false
+bot-vs-bot = false
+attack-invincible = false
+max-target-distance = 28.0  # 1.0 to 128.0
+melee-range = 2.8  # 1.0 to 6.0
+melee-standoff = 2.0  # 0.5 to 5.0
+attack-cooldown = 16  # 1 to 100
+ping-millis = 42  # 0 to 500
+miss-chance = 11  # 0 to 100
+mistake-chance = 9  # 0 to 100
+leader-call-seconds = 38  # 0 to 600
+reaction-ticks = 24  # 0 to 200
+spawn-grace = 6  # 0 to 600
+skill = 45  # 0 to 100
+turn-speed = 34.5  # 1.0 to 180.0
+special-weapon-melee-chance = 24  # 0 to 100
+shield-disable-chance = 91  # 0 to 100
+mace-range-bonus = 0.0  # 0.0 to 4.0
+attribute-swap = false
+breach-swap = true
+mace-stun = true
+spear-lunge = true
+swap-cooldown = 26  # 0 to 200
+mace-pearl-launch = false
+mace-defence-shield = 61  # 0 to 100
+mace-defence-flee = 15  # 0 to 100
+mace-totem-chance = 44  # 0 to 100
+mace = true
+elytra-mace = false
+elytra-mace-height = 16  # 8 to 60
+cart-pvp = false
+cart-max-self-damage = 12.0  # 0.0 to 40.0
+cart-cooldown = 72  # 0 to 1200
+crit-chain = true
+cooldown-trick = true
+jump-reset = true
+mirror-punish = true
+hit-select = true
+d-tap = false
+hit-web-combo = false
+sweep-hit = true
+priority-hp-target = true
+shield-read-windup = true
+orbital = false
+orbital-cooldown = 230  # 20 to 2000
+crits = true
+stasis = false
+shield-disable = true
+break-stashes = false
+
+# Walking, bunny hops, wandering, following.
+[movement]
+bhop = true
+speed = 1.0  # 0.1 to 2.0
+wander = true
+follow-distance = 4.5  # 1.0 to 20.0
+
+# Gear, healing, totems, pearls, cobwebs, water.
+[utility]
+auto-equip = true
+auto-repair = true
+auto-repair-bottles = false
+auto-totem = true
+totem-health = 7.0  # 0.0 to 20.0
+retreat = true
+retreat-health = 6.5  # 0.0 to 20.0
+auto-food = true
+food-threshold = 12  # 0 to 20
+auto-shield = true
+shield-health = 10.0  # 0.0 to 20.0
+auto-potion = true
+potion-health = 8.0  # 0.0 to 20.0
+buff-potions = true
+pearls = true
+pearl-escape-health = 6.0  # 0.0 to 20.0
+pearl-chase-distance = 12.5  # 4.0 to 64.0
+pearl-cooldown = 138  # 20 to 600
+cobwebs = true
+cobweb-range = 2.5  # 0.5 to 6.0
+cobweb-cooldown = 208  # 20 to 600
+cobweb-global-cooldown = 51  # 0 to 600
+drain = true
+drain-delay = 22  # 0 to 100
+web-escape-delay = 11  # 0 to 100
+web-escape-fumble-chance = 44  # 0 to 100
+totem-delay-ticks = 8  # 0 to 60
+water-clutch = true
+water-clutch-min-fall = 6.0  # 0.0 to 64.0
+water-clutch-window = 4.5  # 1.0 to 32.0
+water-clutch-pickup = true
+heal-distance-min = 5.0  # 0.0 to 64.0
+heal-distance = 12.0  # 0.0 to 64.0
+heal-distance-max = 28.0  # 0.0 to 128.0
+
+# Bows and crossbows.
+[ranged]
+enabled = true
+min-range = 7.0  # 0.0 to 64.0
+optimal-range = 10.0  # 1.0 to 64.0
+bow-min-draw-ticks = 23  # 1 to 60
+arrow-prediction = true
+shot-gap = 21  # 0 to 200
+volley-size = 4  # 1 to 20
+rest-ticks = 60  # 0 to 600
+
+# What bots may do to blocks: bridge, pillar, dig soft natural cover only. extra-breakable adds block ids.
+[building]
+enabled = true
+bridge = true
+pillar = true
+clear-soft-blocks = true
+cooldown = 8  # 0 to 200
+budget = 51  # 0 to 2000
+max-pillar = 7  # 0 to 64
+extra-breakable = []
+
+# What bots may know: nothing is a target until seen, touched, heard of, ordered or hit.
+[detection]
+enabled = true
+touch-radius = 2.5  # 0.0 to 16.0
+memory-ticks = 115  # 0 to 1200
+invisible-multiplier = 0.1  # 0.0 to 2.0
+sneaking-multiplier = 0.65  # 0.0 to 2.0
+armoured-multiplier = 1.25  # 0.0 to 2.0
+unarmoured-multiplier = 0.85  # 0.0 to 2.0
+
+# The skill knobs, 0..100; -1 follows skill.
+[difficulty]
+aim = -1  # -1 to 100
+reaction = -1  # -1 to 100
+crit-timing = -1  # -1 to 100
+technique = -1  # -1 to 100
+tracking = -1  # -1 to 100
+clutch = -1  # -1 to 100
+shield-disable-speed = -1  # -1 to 100
+shield-charge = 0  # 0 to 100
+strafe = 16  # 0 to 60
+reach-flips = 0  # 0 to 10
+potion-gap = 2.5  # 0.0 to 10.0
+cart-skip = 0  # 0 to 100
+elytra-mace-level = 0  # 0 to 5
+stun-slam-chance = 80  # 0 to 100
+
+# Temperament and the opening walk-in.
+[behaviour]
+playstyle = "default"  # default | aggressive | safe | defensive | balanced | adaptive
+opening = true
+
+# Hits decided by where the swing points.
+[aim]
+aim-hits = true
+aim-height = 84  # 30 to 95
+
+# Field of view (degrees) and hearing (blocks).
+[senses]
+fov = 108  # 30 to 360
+hearing = 18  # 0 to 32
+
+# Fighting smarter.
+[tactics]
+hotbar-only = true
+damage-model = true
+read-opponent = true
+shield-game = true
+edge-play = true
+lava-play = false
+block-off = false
+
+# Habits that make a bot look like a person.
+[human]
+personality = true
+spacing = true
+whiff-punish = true
+tempo = true
+show-items = true
+panic = true
+after-fight = true
+idle-fidget = true
+
+# Mace and spear techniques, each on its own switch.
+[techniques]
+mace-swap = true
+spear-mace-swap = false
+sword-windburst-swap = false
+spear-reach-swap = false
+windcharge-mace = true
+wc-crouch-boost = true
+cooldown-discipline = true
+hit-preference = true
+hotbar-shield-tracking = true
+elytra-wc-boost = false
+spear-dash = true
+dash-chain = false
+spear-macing = false
+wc-reset = false
+wc-self-reset = false
+stun-slam-variant = "optimal"  # one-tick | easy | optimal
+ground-backstab = false
+elytra-backstab = false
+spear-stun-slam = false
+shield-drain = true
+detap-spear-mace = false
+detap-breach = false
+spear-double-pop = false
+wc-cancel = false
+wc-cancel-chance = 7  # 0 to 100
+rocket-mace = "spiral"  # off | climb | spiral | angled | overhead
+elytra-spear = false
+elytra-chain = false
+pearl-catch = "standard"  # smart | standard | instant | angle
+
+# Healing style and the off hand.
+[survival]
+healing = "advanced"  # advanced | old
+offhand = "auto"  # auto | totem | shield
+offhand-totem-hearts = 5.25  # 0.5 to 10.0
+mace-totem = true
+combo-answers = true
+hunger-stop = true
+
+# Cobweb plays.
+[webs]
+web-prediction = false
+head-web = false
+hit-web = false
+web-drain-chance = 85  # 0 to 100
+web-cut = true
+
+# Chorus and fire escapes.
+[escapes]
+chorus-escape = true
+fire-escape = false
+
+# Restocking from an ender chest or a shulker box.
+[regear]
+enderchest-regear = true
+shulker-regear = true
+regear-distance = 22.0  # 8.0 to 64.0
+shulker-restock = false
+shulker-steal = false
+
+# Other items bots use.
+[items]
+fishing-rod = true
+trident = true
+crossbow-ammo = true
+throw-potions = true
+spear-charge = false
+block-clutch = true
+
+# Team play inside a faction.
+[team]
+focus-fire = true
+peel = true
+heal-allies = true
+regear-turns = true
+
+# Large groups: ripple, pile cap, morale, roles, formations.
+[army]
+reaction-ripple = true
+pile-cap = 2  # 0 to 10
+skill-spread = 15  # 0 to 30
+morale = true
+roles = true
+loose-formations = true
+ally-care = true
+
+# Bots handed to a player are parked above this world's spawn while the owner is offline.
+[companions]
+holding-world = "world"
+
+# Bot skins: random = missing | always | off. pool adds account names to the built-in pool.
+[skins]
+random = "missing"
+built-in-pool = true
+pool = []
+
+# Named pools of bot names for /horizonbot spawn names:<table> <count>.
+[name-tables]
+default = ["Ash", "Birch", "Cedar", "Dune", "Ember", "Flint", "Gale", "Heron"]
+raiders = ["raider1", "raider2", "raider3", "raider4", "raider5", "raider6", "raider7", "raider8", "raider9", "raider10", "raider11", "raider12", "raider13", "raider14", "raider15", "raider16", "raider17", "raider18", "raider19", "raider20", "raider21", "raider22", "raider23", "raider24", "raider25", "raider26", "raider27", "raider28", "raider29", "raider30", "raider31", "raider32", "raider33", "raider34", "raider35", "raider36", "raider37", "raider38", "raider39", "raider40"]
+
+# Odds for /horizonbot randomplaystyle.
+[playstyle-weights]
+default = 30
+aggressive = 15
+safe = 10
+defensive = 15
+balanced = 20
+adaptive = 10
+
+
+# Presets: any setting by its short name (as /horizonbot set takes it).
+[presets.casual]
+skill = 20
+miss-chance = 34
+mistake-chance = 40
+attack-cooldown = 20
+reaction-ticks = 70
+ping-millis = 90
+crits = false
+pearls = false
+cobwebs = false
+buff-potions = false
+mace = false
+
+[presets.easy]
+skill = 10
+aim = 12
+reaction = 8
+crit-timing = 8
+technique = 6
+tracking = 12
+clutch = 5
+shield-disable-speed = 8
+shield-charge = 100
+strafe = 6
+reach-flips = 8
+potion-gap = 4.0
+cart-skip = 70
+elytra-mace-level = 1
+stun-slam-chance = 15
+miss-chance = 28
+mistake-chance = 33
+web-escape-delay = 34
+drain-delay = 34
+attack-cooldown = 18
+crit-chain = false
+hit-select = false
+mirror-punish = false
+cobwebs = false
+pearls = false
+shield-disable = false
+buff-potions = false
+healing = "old"
+combo-answers = false
+read-opponent = false
+shield-game = false
+elytra-mace = false
+mace-pearl-launch = false
+cart-pvp = false
+
+[presets.normal]
+skill = 45
+aim = 44
+reaction = 38
+crit-timing = 40
+technique = 36
+tracking = 42
+clutch = 38
+shield-disable-speed = 40
+shield-charge = 85
+strafe = 16
+reach-flips = 4
+potion-gap = 2.5
+cart-skip = 45
+elytra-mace-level = 2
+stun-slam-chance = 35
+miss-chance = 14
+mistake-chance = 18
+web-escape-delay = 17
+drain-delay = 20
+attack-cooldown = 14
+crit-chain = false
+hit-select = true
+jump-reset = false
+mirror-punish = false
+cobwebs = true
+pearls = true
+shield-disable = true
+shield-disable-chance = 65
+buff-potions = true
+healing = "advanced"
+combo-answers = true
+read-opponent = false
+shield-game = true
+elytra-mace = false
+mace-pearl-launch = false
+cart-pvp = false
+
+[presets.hard]
+skill = 62
+aim = 64
+reaction = 58
+crit-timing = 62
+technique = 58
+tracking = 64
+clutch = 62
+shield-disable-speed = 64
+shield-charge = 65
+strafe = 24
+reach-flips = 3
+potion-gap = 2.0
+cart-skip = 28
+elytra-mace-level = 3
+stun-slam-chance = 58
+miss-chance = 8
+mistake-chance = 10
+web-escape-delay = 11
+drain-delay = 12
+attack-cooldown = 13
+crit-chain = true
+hit-select = true
+jump-reset = true
+mirror-punish = true
+cobwebs = true
+web-prediction = true
+head-web = true
+pearls = true
+shield-disable = true
+shield-disable-chance = 80
+buff-potions = true
+healing = "advanced"
+combo-answers = true
+read-opponent = true
+shield-game = true
+damage-model = true
+edge-play = true
+elytra-mace = true
+mace-pearl-launch = true
+cart-pvp = false
+
+[presets.expert]
+skill = 78
+aim = 80
+reaction = 78
+crit-timing = 78
+technique = 76
+tracking = 78
+clutch = 82
+shield-disable-speed = 82
+shield-charge = 45
+strafe = 32
+reach-flips = 2
+potion-gap = 1.5
+cart-skip = 12
+elytra-mace-level = 4
+stun-slam-chance = 80
+miss-chance = 5
+mistake-chance = 6
+web-escape-delay = 7
+drain-delay = 7
+attack-cooldown = 12
+ping-millis = 30
+crit-chain = true
+hit-select = true
+jump-reset = true
+mirror-punish = true
+d-tap = true
+whiff-punish = true
+cobwebs = true
+web-prediction = true
+head-web = true
+hit-web = true
+pearls = true
+shield-disable = true
+shield-disable-chance = 92
+buff-potions = true
+healing = "advanced"
+combo-answers = true
+read-opponent = true
+shield-game = true
+damage-model = true
+edge-play = true
+elytra-mace = true
+elytra-chain = true
+mace-pearl-launch = true
+attribute-swap = true
+cart-pvp = true
+detap-breach = true
+
+[presets.sweaty]
+skill = 90
+miss-chance = 2
+mistake-chance = 3
+attack-cooldown = 10
+ping-millis = 20
+reaction-ticks = 6
+crits = true
+shield-disable = true
+buff-potions = true
+cobwebs = true
+mace-pearl-launch = true
+attribute-swap = true
+elytra-mace = true
+cart-pvp = true
+wc-reset = true
+spear-double-pop = true
+
+[presets.passive]
+auto-target = false
+wander = false
+bot-vs-bot = false
+revenge = true
+retreat-health = 9.0
