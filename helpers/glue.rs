@@ -352,6 +352,15 @@ fn admit_queued(game: &mut Game<'_>) {
                 g.held_chunks.insert((dim.clone(), chunk[0], chunk[1]), 400);
                 game.native_chunk_load_request("horizonbot:spawn", dim, chunk);
             }
+            // A bot comes in new: what the server saved of its last life is gone. A bot kicked at its
+            // death was saved dead (health 0), and the same name (the generator repeats names) then joined
+            // dead and was kicked again.
+            if let Some(dir) = game.native_world_dir() {
+                let id = pc::stats::uuid_text(uuid);
+                for (sub, ext) in [("players/data", "dat"), ("players/data", "dat_old"), ("playerdata", "dat"), ("playerdata", "dat_old")] {
+                    let _ = std::fs::remove_file(dir.join(sub).join(format!("{id}.{ext}")));
+                }
+            }
             // Announced before the join, so the hub makes the bot a fake player from its first packet,
             // and places it where it was spawned (no hop from the world spawn).
             let placed = match &spawn {
@@ -1623,7 +1632,7 @@ fn run_effect(game: &mut Game<'_>, e: Effect) {
             if let Some(dir) = game.native_world_dir() {
                 for u in uuids {
                     let id = pc::stats::uuid_text(u);
-                    for (sub, ext) in [("playerdata", "dat"), ("playerdata", "dat_old"), ("stats", "json"), ("advancements", "json")] {
+                    for (sub, ext) in [("players/data", "dat"), ("players/data", "dat_old"), ("players/stats", "json"), ("players/advancements", "json"), ("playerdata", "dat"), ("playerdata", "dat_old"), ("stats", "json"), ("advancements", "json")] {
                         let _ = std::fs::remove_file(dir.join(sub).join(format!("{id}.{ext}")));
                     }
                 }
