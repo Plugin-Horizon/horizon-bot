@@ -372,6 +372,8 @@ fn answer_server(game: &mut Game<'_>) {
         let mut out: Vec<(u32, S)> = Vec::new();
         let mut moved: Vec<(String, Option<Vec3>, Option<Vec3>)> = Vec::new();
         let mut kicked: Vec<u128> = Vec::new();
+        // Knockback the server sent: the engine's own momentum for the bot's next tick starts from it.
+        let mut pushed: Vec<(u128, [f64; 3])> = Vec::new();
         for c in g.conns.iter_mut() {
             // A bot's entity id is read from the hub once (it never changes), not for every bot each tick.
             if c.entity_id == 0 {
@@ -411,6 +413,7 @@ fn answer_server(game: &mut Game<'_>) {
                         }
                         C::SetEntityMotion(m) if m.id == my_id => {
                             c.motion = Some(m.velocity);
+                            pushed.push((c.uuid, m.velocity));
                             moved.push((c.name.clone(), None, Some(Vec3::from_array(m.velocity))));
                         }
                         C::ChunkBatchFinished(_) => out.push((c.conn, S::ChunkBatchReceived(play::ChunkBatchReceived { chunks_per_tick: 32.0 }))),
@@ -425,6 +428,20 @@ fn answer_server(game: &mut Game<'_>) {
         }
         for (conn, p) in out {
             pb::send(g, conn, p);
+        }
+        // `engine_move` starts from the last engine tick's velocity, so a push the server sent
+        // (a hit's knockback, a pearl, a fall into a bounce) has to replace it there too, or the
+        // bot walks through its own knockback as if nothing hit it.
+        for (uuid, v) in pushed {
+            let at = game.lan.as_ref().and_then(|h| h.hub.guest_by_uuid(uuid)).map(|g| Vec3::from_array(g.position));
+            ENGINE_MOVES.with(|e| {
+                let mut e = e.borrow_mut();
+                if let Some(at) = at {
+                    e.insert(uuid, (at, v));
+                } else if let Some(entry) = e.get_mut(&uuid) {
+                    entry.1 = v;
+                }
+            });
         }
         if let Some(plugin) = g.plugin.as_mut() {
             for (name, pos, vel) in moved {
