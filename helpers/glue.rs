@@ -85,6 +85,7 @@ pub(super) fn logged_in(game: &mut Game<'_>, uuid: u128, name: &str) {
     if pb::is_bot(uuid) {
         let found = game.lan.as_ref().and_then(|h| h.hub.guest_by_uuid(uuid)).map(|g| (g.entity_id, g.position));
         pb::with(|g| {
+            g.fresh.push((uuid, name.to_owned()));
             if let (Some(plugin), Some((entity, position))) = (g.plugin.as_mut(), found) {
                 plugin.bot_joined(name, entity, Vec3::from_array(position));
             }
@@ -285,6 +286,13 @@ pub(super) fn server_tick_start(game: &mut Game<'_>) {
     for (name, dim, pos) in due {
         teleport_by_name(game, &name, &dim, pos);
     }
+    // A bot starts as a fresh survival player with nothing on it: the server may force creative, and an
+    // old save under the same name may hold items.
+    let fresh = pb::with(|g| std::mem::take(&mut g.fresh));
+    for (uuid, name) in fresh {
+        game.native_set_game_mode(uuid, 0);
+        game.native_run_command(&format!("clear {name}"));
+    }
 }
 
 /// Lets queued bots in: at most `joins-per-tick` a tick, and no more once the joins of this tick have
@@ -296,6 +304,21 @@ fn admit_queued(game: &mut Game<'_>) {
         c.replace(Some(now)).map_or(0.0, |t| now.duration_since(t).as_secs_f64() * 1000.0)
     });
     pb::with(|g| {
+        // Chunks held for bots that have joined by now: let go after a while (a bot keeps its own).
+        if !g.held_chunks.is_empty() {
+            let due: Vec<(String, i32, i32)> = g
+                .held_chunks
+                .iter_mut()
+                .filter_map(|(k, t)| {
+                    *t = t.saturating_sub(1);
+                    (*t == 0).then(|| k.clone())
+                })
+                .collect();
+            for k in due {
+                g.held_chunks.remove(&k);
+                game.native_chunk_load_release("horizonbot:spawn", &k.0, [k.1, k.2]);
+            }
+        }
         if g.join_queue.is_empty() {
             return;
         }
@@ -303,8 +326,32 @@ fn admit_queued(game: &mut Game<'_>) {
         let per_tick = pc::config::joins_for_tick(per_tick, last_tick_ms);
         let started = std::time::Instant::now();
         let mut joined = 0u32;
-        while pc::config::may_join_more(per_tick, joined, started.elapsed().as_secs_f64() * 1000.0) {
+        // A bot whose chunk is not loaded yet waits (and the chunk is asked for): placed there, it would
+        // fall through the empty ground and die. Waiting bots go to the back; after 600 ticks one comes in anyway.
+        let mut waiting = Vec::new();
+        let mut scanned = 0usize;
+        let total = g.join_queue.len();
+        while scanned < total && pc::config::may_join_more(per_tick, joined, started.elapsed().as_secs_f64() * 1000.0) {
+            scanned += 1;
             let Some((name, uuid, skin, spawn)) = g.join_queue.pop_front() else { break };
+            if let Some((dim, pos, _)) = &spawn {
+                let chunk = [(pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4];
+                if !game.native_chunk_is_loaded(dim, chunk) {
+                    let waited = g.chunk_wait.entry(name.to_ascii_lowercase()).or_insert(0);
+                    *waited += 1;
+                    if *waited < 600 {
+                        if *waited % 20 == 1 {
+                            game.native_chunk_load_request("horizonbot:spawn", dim, chunk);
+                        }
+                        waiting.push((name, uuid, skin, spawn));
+                        continue;
+                    }
+                }
+                g.chunk_wait.remove(&name.to_ascii_lowercase());
+                // Held while the bot joins and finds its feet.
+                g.held_chunks.insert((dim.clone(), chunk[0], chunk[1]), 400);
+                game.native_chunk_load_request("horizonbot:spawn", dim, chunk);
+            }
             // Announced before the join, so the hub makes the bot a fake player from its first packet,
             // and places it where it was spawned (no hop from the world spawn).
             let placed = match &spawn {
@@ -321,6 +368,7 @@ fn admit_queued(game: &mut Game<'_>) {
             }
             joined += 1;
         }
+        g.join_queue.extend(waiting);
     });
 }
 

@@ -71,6 +71,12 @@ pub struct Glue {
     pub last_damage: Vec<(i32, i32, f32)>,
     /// Teleports for bots not placed yet: (name, dimension, position, ticks left to try).
     pub pending_tp: Vec<(String, String, [f64; 3], u32)>,
+    /// Bots that joined and still start as a fresh survival player: (uuid, name).
+    pub fresh: Vec<(u128, String)>,
+    /// Chunks held loaded for a bot about to join: (dimension, chunk x, chunk z) -> ticks left to hold.
+    pub held_chunks: std::collections::HashMap<(String, i32, i32), u32>,
+    /// How many ticks a queued bot (lower case name) has waited for its chunk.
+    pub chunk_wait: std::collections::HashMap<String, u32>,
     /// Bots admitted a few per tick (`joins-per-tick`): (name, uuid, skin, where it appears:
     /// dimension, position, yaw; None where no place is known).
     pub join_queue: std::collections::VecDeque<(String, u128, Option<(String, String)>, Option<(String, [f64; 3], f32)>)>,
@@ -93,6 +99,9 @@ impl Default for Glue {
             tick: 0,
             last_damage: Vec::new(),
             pending_tp: Vec::new(),
+            fresh: Vec::new(),
+            held_chunks: std::collections::HashMap::new(),
+            chunk_wait: std::collections::HashMap::new(),
             join_queue: std::collections::VecDeque::new(),
         }
     }
