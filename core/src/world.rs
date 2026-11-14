@@ -22,7 +22,8 @@ pub enum Shape {
     /// Fences and walls: 1.5 high, narrow, but a player can't step over them.
     Post,
     /// Several boxes, in block-local coordinates (min x, y, z, max x, y, z): stairs.
-    Boxes(Vec<[f64; 6]>),
+    /// Shared, so cloning a stair block copies no boxes.
+    Boxes(std::sync::Arc<[[f64; 6]]>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -105,7 +106,7 @@ impl Block {
             }
             Shape::Boxes(ref boxes) => {
                 let o = crate::math::Vec3::new(x as f64, y as f64, z as f64);
-                for b in boxes {
+                for b in boxes.iter() {
                     out.push(Aabb::new(o + crate::math::Vec3::new(b[0], b[1], b[2]), o + crate::math::Vec3::new(b[3], b[4], b[5])));
                 }
             }
@@ -317,10 +318,10 @@ pub fn classify(state: &str) -> Block {
             Some("east") => (0.5, 1.0, 0.0, 1.0),
             _ => (0.0, 1.0, 0.0, 0.5),
         };
-        b.shape = Shape::Boxes(vec![
+        b.shape = Shape::Boxes(std::sync::Arc::from(vec![
             [0.0, slab_y[0], 0.0, 1.0, slab_y[1], 1.0],
             [x0, step_y[0], z0, x1, step_y[1], z1],
-        ]);
+        ]));
         b.protected = true;
         return b;
     }
@@ -379,37 +380,101 @@ pub trait BlockView {
     }
 
     /// Whether the straight line between two points passes no solid block (eyes to eyes).
+    /// A voxel walk (Amanatides-Woo): every cell on the line is read once and the line is tested
+    /// exactly against its boxes. Unloaded cells block; leaves and glass block too (a bot is not an x-ray).
     fn line_of_sight(&self, from: crate::math::Vec3, to: crate::math::Vec3) -> bool {
         let d = to - from;
-        let len = d.length();
-        if len < 1e-6 {
+        if d.length() < 1e-6 {
             return true;
         }
-        let steps = (len * 4.0).ceil() as usize;
-        let mut last = [i32::MIN; 3];
-        let mut boxes = Vec::new();
-        for i in 1..steps {
-            let p = from + d * (i as f64 / steps as f64);
-            let b = p.block();
-            if b == last {
-                continue;
+        let f = [from.x, from.y, from.z];
+        let dv = [d.x, d.y, d.z];
+        let mut cell = from.block();
+        let end = to.block();
+        let mut step = [0i32; 3];
+        let mut t_max = [f64::INFINITY; 3];
+        let mut t_delta = [f64::INFINITY; 3];
+        for i in 0..3 {
+            if dv[i] > 0.0 {
+                step[i] = 1;
+                t_delta[i] = 1.0 / dv[i];
+                t_max[i] = ((cell[i] + 1) as f64 - f[i]) / dv[i];
+            } else if dv[i] < 0.0 {
+                step[i] = -1;
+                t_delta[i] = -1.0 / dv[i];
+                t_max[i] = (cell[i] as f64 - f[i]) / dv[i];
             }
-            last = b;
-            let blk = self.block(b[0], b[1], b[2]);
+        }
+        let mut left = (0..3).map(|i| (end[i] - cell[i]).abs()).sum::<i32>() + 1;
+        let mut boxes: Vec<Aabb> = Vec::new();
+        loop {
+            let blk = self.block(cell[0], cell[1], cell[2]);
             if blk.unloaded {
                 return false;
             }
-            boxes.clear();
-            blk.boxes(b[0], b[1], b[2], &mut boxes);
-            // Leaves and glass-like blocks still block here: a bot is not an x-ray.
-            if boxes.iter().any(|bx| {
-                bx.min.x <= p.x && p.x <= bx.max.x && bx.min.y <= p.y && p.y <= bx.max.y && bx.min.z <= p.z && p.z <= bx.max.z
-            }) {
+            match blk.shape {
+                Shape::Empty => {}
+                // The walk may visit a cell the line only touches at an edge (an exact tie): the box test decides.
+                Shape::Full => {
+                    if segment_hits(&Aabb::block(cell[0], cell[1], cell[2], 1.0), f, dv) {
+                        return false;
+                    }
+                }
+                _ => {
+                    boxes.clear();
+                    blk.boxes(cell[0], cell[1], cell[2], &mut boxes);
+                    if boxes.iter().any(|b| segment_hits(b, f, dv)) {
+                        return false;
+                    }
+                }
+            }
+            left -= 1;
+            if left <= 0 || cell == end {
+                return true;
+            }
+            let axis = if t_max[0] <= t_max[1] && t_max[0] <= t_max[2] {
+                0
+            } else if t_max[1] <= t_max[2] {
+                1
+            } else {
+                2
+            };
+            if t_max[axis] > 1.0 {
+                return true;
+            }
+            cell[axis] += step[axis];
+            t_max[axis] += t_delta[axis];
+        }
+    }
+}
+
+/// Whether the segment `from + t * d`, `t` in 0..=1, meets the box (slab test; flat boxes never block).
+fn segment_hits(b: &Aabb, from: [f64; 3], d: [f64; 3]) -> bool {
+    let min = [b.min.x, b.min.y, b.min.z];
+    let max = [b.max.x, b.max.y, b.max.z];
+    let (mut t0, mut t1) = (0.0f64, 1.0f64);
+    for i in 0..3 {
+        if max[i] <= min[i] {
+            return false;
+        }
+        if d[i].abs() < 1e-12 {
+            if from[i] < min[i] || from[i] > max[i] {
+                return false;
+            }
+        } else {
+            let (mut a, mut c) = ((min[i] - from[i]) / d[i], (max[i] - from[i]) / d[i]);
+            if a > c {
+                std::mem::swap(&mut a, &mut c);
+            }
+            t0 = t0.max(a);
+            t1 = t1.min(c);
+            // Touching an edge or a corner only (t0 == t1) is not a hit: sight passes between two blocks.
+            if t0 >= t1 {
                 return false;
             }
         }
-        true
     }
+    true
 }
 
 /// A sparse test world: blocks by position, air elsewhere.
@@ -474,6 +539,18 @@ mod tests {
     }
 
     #[test]
+    fn line_of_sight_passes_between_two_blocks_touching_at_an_edge() {
+        use crate::math::Vec3;
+        let mut w = MapWorld::flat(63);
+        w.set(1, 64, 0, "minecraft:stone");
+        w.set(0, 64, 1, "minecraft:stone");
+        // Exactly through the shared vertical edge at x = 1, z = 1.
+        assert!(w.line_of_sight(Vec3::new(0.5, 64.5, 0.5), Vec3::new(1.5, 64.5, 1.5)));
+        w.set(1, 64, 1, "minecraft:stone");
+        assert!(!w.line_of_sight(Vec3::new(0.5, 64.5, 0.5), Vec3::new(1.5, 64.5, 1.5)));
+    }
+
+    #[test]
     fn line_of_sight_is_blocked_by_a_wall() {
         let mut w = MapWorld::flat(63);
         use crate::math::Vec3;
@@ -482,5 +559,161 @@ mod tests {
         assert!(w.line_of_sight(a, b));
         w.set(3, 65, 0, "minecraft:stone");
         assert!(!w.line_of_sight(a, b));
+    }
+
+    /// The previous implementation: four samples per block, a box test at each.
+    fn old_los(w: &MapWorld, from: crate::math::Vec3, to: crate::math::Vec3) -> bool {
+        let d = to - from;
+        let len = d.length();
+        if len < 1e-6 {
+            return true;
+        }
+        let steps = (len * 4.0).ceil() as usize;
+        let mut last = [i32::MIN; 3];
+        let mut boxes = Vec::new();
+        for i in 1..steps {
+            let p = from + d * (i as f64 / steps as f64);
+            let b = p.block();
+            if b == last {
+                continue;
+            }
+            last = b;
+            let blk = w.block(b[0], b[1], b[2]);
+            if blk.unloaded {
+                return false;
+            }
+            boxes.clear();
+            blk.boxes(b[0], b[1], b[2], &mut boxes);
+            if boxes
+                .iter()
+                .any(|bx| bx.min.x <= p.x && p.x <= bx.max.x && bx.min.y <= p.y && p.y <= bx.max.y && bx.min.z <= p.z && p.z <= bx.max.z)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// A dense reference: 200 points per block, every point tested (no per-cell shortcut).
+    fn dense_los(w: &MapWorld, from: crate::math::Vec3, to: crate::math::Vec3) -> bool {
+        let d = to - from;
+        let steps = (d.length() * 200.0).ceil() as usize;
+        let mut boxes = Vec::new();
+        for i in 1..steps {
+            let p = from + d * (i as f64 / steps as f64);
+            let b = p.block();
+            let blk = w.block(b[0], b[1], b[2]);
+            boxes.clear();
+            blk.boxes(b[0], b[1], b[2], &mut boxes);
+            if boxes
+                .iter()
+                .any(|bx| bx.min.x <= p.x && p.x <= bx.max.x && bx.min.y <= p.y && p.y <= bx.max.y && bx.min.z <= p.z && p.z <= bx.max.z)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn line_of_sight_slabs_stairs_and_diagonals() {
+        use crate::math::Vec3;
+        let mut w = MapWorld::flat(63);
+        // A bottom slab: a line over it passes, a line through it does not.
+        w.set(3, 64, 0, "minecraft:oak_slab[type=bottom]");
+        assert!(w.line_of_sight(Vec3::new(0.5, 64.8, 0.5), Vec3::new(6.5, 64.8, 0.5)));
+        assert!(!w.line_of_sight(Vec3::new(0.5, 64.3, 0.5), Vec3::new(6.5, 64.3, 0.5)));
+        // A top slab is the other way round.
+        w.set(3, 64, 4, "minecraft:oak_slab[type=top]");
+        assert!(w.line_of_sight(Vec3::new(0.5, 64.3, 4.5), Vec3::new(6.5, 64.3, 4.5)));
+        assert!(!w.line_of_sight(Vec3::new(0.5, 64.8, 4.5), Vec3::new(6.5, 64.8, 4.5)));
+        // A stair facing north: tall half on the north side (z < 0.5).
+        w.set(3, 64, 8, "minecraft:oak_stairs[facing=north,half=bottom]");
+        assert!(w.line_of_sight(Vec3::new(0.5, 64.8, 8.8), Vec3::new(6.5, 64.8, 8.8)));
+        assert!(!w.line_of_sight(Vec3::new(0.5, 64.8, 8.2), Vec3::new(6.5, 64.8, 8.2)));
+        // A diagonal line through a pillar, and one that misses it.
+        w.set(5, 65, 5, "minecraft:stone");
+        assert!(!w.line_of_sight(Vec3::new(2.5, 65.5, 2.5), Vec3::new(8.5, 65.5, 8.5)));
+        assert!(w.line_of_sight(Vec3::new(2.5, 65.5, 3.7), Vec3::new(8.5, 65.5, 9.7)));
+        // Leaves and glass block, a fence post blocks, an open gate does not.
+        w.set(10, 65, 10, "minecraft:oak_leaves");
+        w.set(10, 65, 12, "minecraft:glass");
+        assert!(!w.line_of_sight(Vec3::new(8.5, 65.5, 10.5), Vec3::new(12.5, 65.5, 10.5)));
+        assert!(!w.line_of_sight(Vec3::new(8.5, 65.5, 12.5), Vec3::new(12.5, 65.5, 12.5)));
+        // Same point, and straight up and down.
+        assert!(w.line_of_sight(Vec3::new(1.5, 65.5, 1.5), Vec3::new(1.5, 65.5, 1.5)));
+        assert!(w.line_of_sight(Vec3::new(1.5, 65.5, 1.5), Vec3::new(1.5, 70.5, 1.5)));
+        assert!(!w.line_of_sight(Vec3::new(1.5, 70.5, 1.5), Vec3::new(1.5, 60.5, 1.5)));
+    }
+
+    #[test]
+    fn line_of_sight_unloaded_blocks() {
+        use crate::math::Vec3;
+        struct Hole(MapWorld);
+        impl BlockView for Hole {
+            fn block(&self, x: i32, y: i32, z: i32) -> Block {
+                if x == 3 {
+                    Block::unloaded()
+                } else {
+                    self.0.block(x, y, z)
+                }
+            }
+        }
+        let w = Hole(MapWorld::flat(63));
+        assert!(!w.line_of_sight(Vec3::new(0.5, 65.5, 0.5), Vec3::new(6.5, 65.5, 0.5)));
+        assert!(w.line_of_sight(Vec3::new(0.5, 65.5, 0.5), Vec3::new(2.5, 65.5, 0.5)));
+    }
+
+    #[test]
+    fn line_of_sight_agrees_with_a_dense_reference_on_random_lines() {
+        use crate::math::Vec3;
+        let mut w = MapWorld::flat(63);
+        let mut rng = 12345u64;
+        let mut next = move || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((rng >> 33) as f64) / ((1u64 << 31) as f64)
+        };
+        for _ in 0..120 {
+            let (x, y, z) = ((next() * 20.0) as i32, 64 + (next() * 3.0) as i32, (next() * 20.0) as i32);
+            let st =
+                ["minecraft:stone", "minecraft:oak_slab[type=top]", "minecraft:oak_stairs[facing=east,half=bottom]", "minecraft:oak_fence"]
+                    [(next() * 4.0) as usize];
+            w.set(x, y, z, st);
+        }
+        let (mut differ, mut blocked) = (0, 0);
+        for _ in 0..4000 {
+            let a = Vec3::new(next() * 20.0, 64.0 + next() * 3.0, next() * 20.0);
+            let b = Vec3::new(next() * 20.0, 64.0 + next() * 3.0, next() * 20.0);
+            let (n, o) = (w.line_of_sight(a, b), old_los(&w, a, b));
+            blocked += !n as i32;
+            // Against the dense reference; the old sampling tested one point per cell and missed a lot.
+            differ += (n != dense_los(&w, a, b)) as i32;
+            // The old one could only miss thin things (a sample between two cells), never invent a block.
+            assert!(!(n && !o), "new sees through what the old one hit: {a:?} -> {b:?}");
+        }
+        assert!(blocked > 300, "test world too empty: {blocked}");
+        assert!(differ < 60, "{differ} of 4000 differ from the dense reference");
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_line_of_sight() {
+        use crate::math::Vec3;
+        let mut w = MapWorld::flat(63);
+        for x in (4..60).step_by(7) {
+            w.set(x, 65, 5, "minecraft:stone");
+            w.set(x, 64, 5, "minecraft:oak_stairs[facing=north,half=bottom]");
+        }
+        let (a, b) = (Vec3::new(0.5, 65.6, 0.5), Vec3::new(40.5, 65.6, 10.5));
+        for (name, f) in [("new", 0), ("old", 1)] {
+            let t = std::time::Instant::now();
+            let mut n = 0u32;
+            for i in 0..1_000_000u32 {
+                let o = (i % 7) as f64 * 0.01;
+                let (a, b) = (Vec3::new(a.x + o, a.y, a.z), Vec3::new(b.x, b.y, b.z + o));
+                n += if f == 0 { w.line_of_sight(a, b) } else { old_los(&w, a, b) } as u32;
+            }
+            println!("bench_line_of_sight {name}: {:?} per 1M calls ({n} seen)", t.elapsed());
+        }
     }
 }

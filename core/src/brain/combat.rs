@@ -41,44 +41,66 @@ fn notice_range(bot: &Bot, s: &Seen) -> f64 {
     r
 }
 
-/// Detection: in sight (field of view, line of sight, range), touching distance, or known.
-pub fn can_notice(bot: &Bot, p: &Perception, s: &Seen) -> bool {
+/// What the rules that need no block read say about noticing `s`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Notice {
+    Yes,
+    No,
+    /// In range and in the field of view: the line of sight decides.
+    IfSeen,
+}
+
+fn notice_cheaply(bot: &Bot, s: &Seen) -> Notice {
     let st = &bot.settings;
     let d = s.pos.distance(bot.body.pos);
     if d > st.f("max-target-distance") {
-        return false;
+        return Notice::No;
     }
     if !st.b("detection") {
-        return true;
+        return Notice::Yes;
     }
     if d <= st.f("detection-touch-radius") || bot.known.contains_key(&s.id) {
-        return true;
+        return Notice::Yes;
     }
     if d > notice_range(bot, s) {
-        return false;
+        return Notice::No;
     }
     let fov = st.f("fov");
     if fov < 360.0 {
         let to = yaw_to(bot.body.pos, s.pos);
         if wrap_degrees(to - bot.body.yaw).abs() as f64 > fov / 2.0 {
-            return false;
+            return Notice::No;
         }
     }
-    // Looked up again every few ticks (a line of sight is a block read per quarter block).
-    {
-        let cache = bot.sight_cache.borrow();
-        if let Some(&(t, seen)) = cache.get(&s.id) {
-            if p.tick < t + 4 {
-                return seen;
-            }
+    Notice::IfSeen
+}
+
+/// Detection: in sight (field of view, line of sight, range), touching distance, or known.
+pub fn can_notice(bot: &Bot, p: &Perception, s: &Seen) -> bool {
+    match notice_cheaply(bot, s) {
+        Notice::Yes => true,
+        Notice::No => false,
+        Notice::IfSeen => sees(bot, p, s),
+    }
+}
+
+/// Line of sight from the bot's eyes to another's, reused for up to 4 ticks while neither eye
+/// moved more than half a block.
+pub fn sees(bot: &Bot, p: &Perception, s: &Seen) -> bool {
+    let (from, to) = (bot.body.eye(), s.eye());
+    if let Some(&(t, seen, f, o)) = bot.sight_cache.borrow().get(&s.id) {
+        if p.tick < t + 4 && f.distance_sq(from) < 0.25 && o.distance_sq(to) < 0.25 {
+            return seen;
         }
     }
-    let seen = p.world.line_of_sight(bot.body.eye(), s.eye());
+    let t_sight = std::time::Instant::now();
+    let seen = p.world.line_of_sight(from, to);
+    super::prof_add(super::P_SIGHT, t_sight.elapsed().as_nanos() as u64);
     let mut cache = bot.sight_cache.borrow_mut();
     if cache.len() > 64 {
-        cache.retain(|_, (t, _)| p.tick < *t + 4);
+        cache.retain(|_, e| p.tick < e.0 + 4);
     }
-    cache.insert(s.id, (p.tick, seen));
+    cache.insert(s.id, (p.tick, seen, from, to));
     seen
 }
 
@@ -171,6 +193,9 @@ pub fn choose_target(bot: &mut Bot, p: &Perception, squad: &mut Squad) -> Option
     Some(pick)
 }
 
+/// How many candidates a bot weighs fully in one scan: the nearest ones the cheap rules let through.
+pub const TARGET_CANDIDATES: usize = 5;
+
 /// The best target by priority (war, player, mob) and then score, among `only` when it is set.
 fn best_candidate(bot: &mut Bot, p: &Perception, squad: &Squad, only: Option<i32>) -> Option<(i32, f64, Seen)> {
     let tick = p.tick;
@@ -180,17 +205,27 @@ fn best_candidate(bot: &mut Bot, p: &Perception, squad: &Squad, only: Option<i32
     let fighting = bot.fight.target;
     let pile_cap = st.i("pile-cap").max(0) as u32;
     let prefer_low = st.b("priority-hp-target");
-    let mut best: Option<(i32, f64, Seen)> = None;
     let max_distance = st.f("max-target-distance");
+    // Read once: with hundreds of bots this loop runs for every pair, and a setting is a map lookup.
+    let (bot_vs_bot, target_players, target_passive) = (st.b("bot-vs-bot"), st.b("target-players"), st.b("target-passive-mobs"));
+    let focus = my_faction.as_ref().and_then(|f| squad.focus.get(f)).copied().filter(|_| st.b("focus-fire"));
+    let here = bot.body.pos;
+    // First the rules that cost nothing, over everyone: the `TARGET_CANDIDATES` best by priority and
+    // distance are kept. Only those get the line of sight, the pile cap and the full score.
+    let mut near: [Option<(i32, f64, &Seen, Notice)>; TARGET_CANDIDATES] = [None; TARGET_CANDIDATES];
     for s in p.others {
         if only.is_some_and(|id| s.id != id) {
             continue;
         }
-        // `can_notice` below turns away everything past this; asking first spares the relation lookups.
-        if s.pos.distance(bot.body.pos) > max_distance {
+        let dist = s.pos.distance(here);
+        if dist > max_distance {
             continue;
         }
-        if !hittable(bot, s, squad) || s.passive && !st.b("target-passive-mobs") && !s.is_player && !s.hostile {
+        // A bot among bots it may not fight: nothing else to ask (the common case in a crowd).
+        if s.is_bot && !bot_vs_bot && (my_faction.is_none() || s.faction.is_none()) {
+            continue;
+        }
+        if !hittable(bot, s, squad) || s.passive && !target_passive && !s.is_player && !s.hostile {
             continue;
         }
         let rel = squad.relation(my_faction.as_deref(), s.faction.as_deref());
@@ -199,17 +234,17 @@ fn best_candidate(bot: &mut Bot, p: &Perception, squad: &Squad, only: Option<i32
             continue;
         }
         if !war {
-            if s.is_bot && !st.b("bot-vs-bot") {
+            if s.is_bot && !bot_vs_bot {
                 continue;
             }
-            if s.is_player && !s.is_bot && (!st.b("target-players") || grace) {
+            if s.is_player && !s.is_bot && (!target_players || grace) {
                 continue;
             }
-            if !s.is_player && !s.hostile && !(s.passive && st.b("target-passive-mobs")) {
+            if !s.is_player && !s.hostile && !(s.passive && target_passive) {
                 continue;
             }
         }
-        if bot.orders.hide && s.pos.distance(bot.body.pos) > 6.0 {
+        if bot.orders.hide && dist > 6.0 {
             continue;
         }
         if let Some(g) = &bot.orders.guard {
@@ -217,15 +252,41 @@ fn best_candidate(bot: &mut Bot, p: &Perception, squad: &Squad, only: Option<i32
                 continue;
             }
         }
-        if !can_notice(bot, p, s) {
+        if pile_cap > 0 && Some(s.id) != fighting && squad.pile(s.id) >= pile_cap {
             continue;
         }
-        if pile_cap > 0 && Some(s.id) != fighting && squad.pile(s.id) >= pile_cap {
+        let notice = notice_cheaply(bot, s);
+        if notice == Notice::No {
+            continue;
+        }
+        // A hostile mob at arm's length is as urgent as a player.
+        let prio = if war { 0 } else if s.is_player || (s.hostile && dist < 4.0) { 1 } else { 2 };
+        // The one it fights and the faction's focus stay in the running from further away (their score bonus).
+        let key = dist - if Some(s.id) == fighting { 3.0 } else { 0.0 } - if Some(s.id) == focus { 4.0 } else { 0.0 };
+        // A free slot, else the worst one kept if this one is better.
+        let mut slot = 0;
+        for (i, n) in near.iter().enumerate() {
+            match (n, &near[slot]) {
+                (None, _) => {
+                    slot = i;
+                    break;
+                }
+                (Some(o), Some(w)) if o.0 > w.0 || (o.0 == w.0 && o.1 > w.1) => slot = i,
+                _ => {}
+            }
+        }
+        if near[slot].as_ref().is_none_or(|w| prio < w.0 || (prio == w.0 && key < w.1)) {
+            near[slot] = Some((prio, key, s, notice));
+        }
+    }
+    let mut best: Option<(i32, f64, Seen)> = None;
+    for (prio, _, s, notice) in near.into_iter().flatten() {
+        if notice == Notice::IfSeen && !sees(bot, p, s) {
             continue;
         }
         // Sizing up a player it noticed itself.
         if s.is_player && fighting.is_none() {
-            let rt = st.i("reaction-ticks").max(0) as u64;
+            let rt = bot.settings.i("reaction-ticks").max(0) as u64;
             let extra = (rt as f64 * 0.5 * bot.rng.unit()) as u64;
             let entry = bot.noticed.entry(s.id).or_insert((tick, tick + rt + extra));
             if tick < entry.1 {
@@ -233,15 +294,14 @@ fn best_candidate(bot: &mut Bot, p: &Perception, squad: &Squad, only: Option<i32
                 continue;
             }
         }
-        let prio = if war { 0 } else if s.is_player { 1 } else { 2 };
-        let mut score = s.pos.distance(bot.body.pos);
+        let mut score = s.pos.distance(here);
         if prefer_low {
             score += (s.health as f64 / s.max_health.max(1.0) as f64) * 6.0;
         }
         if Some(s.id) == fighting {
             score -= 3.0;
         }
-        if bot.faction.as_ref().and_then(|f| squad.focus.get(f)) == Some(&s.id) && bot.settings.b("focus-fire") {
+        if Some(s.id) == focus {
             score -= 4.0;
         }
         if best.as_ref().is_none_or(|(bp, bs, _)| prio < *bp || (prio == *bp && score < *bs)) {
@@ -262,10 +322,11 @@ fn dist_cmp(bot: &Bot, a: &Seen, b: &Seen) -> std::cmp::Ordering {
 fn swing_ticks(bot: &Bot, held: Option<&items::Stack>) -> f64 {
     let base = bot.settings.f("attack-cooldown");
     let w = items::weapon(held.map_or("air", |s| s.id.as_str()));
-    // attack-cooldown is the sword's (12.5 ticks): other weapons scale with their own speed.
+    // attack-cooldown is the sword's swing in ticks (vanilla's full charge is 12.5): other weapons scale with their own speed.
     let mut t = base * (w.cooldown_ticks() / 12.5);
     if bot.settings.b("cooldown-trick") {
-        // Vanilla crits need the meter above 90%: swing a touch early, never before that.
+        // Vanilla needs the meter above 90% for a full hit: strength = (ticks + 0.5) / full, so swinging at
+        // 92% of the configured ticks (whole ticks, rounded up) never comes before that.
         t *= 0.92;
     }
     t.max(1.0)
@@ -353,7 +414,12 @@ pub fn fight(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, squad: &
 
     // Low and losing: back off (heal() drinks and eats; this keeps the distance).
     let temper = super::personality::Temper::of(bot.playstyle, race(p, t));
-    if st.b("retreat") && (p.me.health as f64) <= st.f("retreat-health") + temper.heal_shift && !temper.heal_in_place {
+    // Running only helps with a way to recover (or when clearly losing); otherwise it fights on.
+    if st.b("retreat")
+        && (p.me.health as f64) <= st.f("retreat-health") + temper.heal_shift
+        && !temper.heal_in_place
+        && (can_recover(p) || race(p, t) < -0.3)
+    {
         d.mode = "retreat";
         let away = bot.body.pos + (bot.body.pos - t.pos).horizontal().normalize() * 8.0;
         bot.flee_to(p, d, away, true);
@@ -408,7 +474,7 @@ pub fn fight(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, squad: &
     // Cobwebs on them (rate-limited per bot and squad-wide).
     if st.b("cobwebs") && flat <= st.f("cobweb-range") && bot.ready("cobweb", tick) && tick >= squad.web_ready_at {
         if let Some(slot) = inv.find(true, |s| s.is("cobweb")) {
-            if p.world.line_of_sight(bot.body.eye(), t.eye()) {
+            if sees(bot, p, t) {
                 // Where: under them; where they are about to step (web prediction); their head
                 // against a wall (head web); where a knockback hit lands them (hit web).
                 let mut at = t.pos.block();
@@ -455,6 +521,13 @@ pub fn fight(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, squad: &
     let flank = super::team::separation(bot, p, squad).or(flank);
     melee(bot, p, d, t, dist, flat, aim_point, sweep, flank);
     super::team::panic(bot, p, d);
+}
+
+/// Something to heal or escape with: a healing potion, a golden apple, a totem or a pearl off cooldown.
+fn can_recover(p: &Perception) -> bool {
+    let inv = &p.me.inventory;
+    inv.count(|s| items::is_healing_potion(s) || s.is("golden_apple") || s.is("enchanted_golden_apple") || s.is("totem_of_undying")) > 0
+        || (inv.has("ender_pearl") && p.me.cooldown("ender_pearl") == 0)
 }
 
 /// The health race: positive when the bot is ahead.
@@ -545,6 +618,12 @@ fn melee(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, dist: f64, f
     // Spacing: keep the standoff, circle at the strafe angle, step out while recharging.
     let standoff = st.f("melee-standoff") + bot.personality.range_bias;
     let held_after = inv.slots.get(selected_after(d, inv)).and_then(Option::as_ref);
+    // A different item in the hand restarts the swing meter (vanilla); the same item with other components does not.
+    let held_id = held_after.map(|s| s.id.clone());
+    if bot.last_held.get_or_insert_with(|| inv.held().map(|s| s.id.clone()).unwrap_or_default()).as_str() != held_id.as_deref().unwrap_or("") {
+        bot.fight.since_swing = 0;
+        bot.last_held = Some(held_id.unwrap_or_default());
+    }
     let cd = swing_ticks(bot, held_after);
     let charged = bot.fight.since_swing as f64 >= cd;
     let mut toward = t.pos;
@@ -571,6 +650,8 @@ fn melee(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, dist: f64, f
         }
         bot.fight.strafe_switch = tick + 15 + bot.rng.int(0, 30) as u64;
     }
+    // A vanilla crit needs a fall without sprinting.
+    let airborne_crit = st.b("crits") && !bot.body.on_ground && !mace_play;
     let mut goal = flank.unwrap_or(toward);
     if flat <= standoff + 1.5 {
         // Circle: a point on the ring around them, `strafe` degrees off the line.
@@ -578,6 +659,11 @@ fn melee(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, dist: f64, f
         let ring = if !charged && st.b("spacing") { (reach + 0.4).max(standoff) } else { standoff };
         goal = t.pos + Vec3::new(-ang.sin(), 0.0, ang.cos()) * ring;
         sprint = false;
+        // A comboer lands its charged hit sprinting (the extra knockback); the ring is for the recharge.
+        if bot.personality.comboer && charged && dist <= reach + 0.5 {
+            goal = t.pos;
+            sprint = true;
+        }
     }
     // Edge play: come round so the next hit knocks them toward the drop.
     if flat < 6.0 {
@@ -589,7 +675,7 @@ fn melee(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, dist: f64, f
     if tick < bot.fight.punish_until {
         // They whiffed: step straight in for the free hit.
         goal = t.pos;
-        sprint = true;
+        sprint = !airborne_crit;
         bot.last_call = "punishing the whiff".into();
     }
     // Tempo: push after landing two, reset after taking two.
@@ -600,7 +686,7 @@ fn melee(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, dist: f64, f
             goal = bot.body.pos + (bot.body.pos - t.pos).horizontal().normalize() * 3.0;
             d.mode = "reset";
         } else if bot.fight.landed_streak >= 2 {
-            sprint = true;
+            sprint = !airborne_crit;
         }
     }
     // Defensive bots never chase past a few blocks.
@@ -651,6 +737,9 @@ fn melee(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, dist: f64, f
         }
     }
     bot.fight.since_swing = 0;
+    if airborne_crit && bot.body.vel.y <= 0.0 && bot.body.fall_distance > 0.0 && !bot.body.in_water && !bot.body.on_climbable {
+        d.input.sprint = false;
+    }
     if sweep {
         // Vanilla sweeps only without sprinting.
         d.input.sprint = false;
@@ -1055,6 +1144,18 @@ mod tests {
         let with = swing_ticks(&bot, Some(&sword));
         let full = bot.settings.f("attack-cooldown");
         assert!(with >= 0.9 * full && with < full, "{with} vs {full}");
+    }
+
+    #[test]
+    fn the_default_swing_is_never_before_vanillas_ninety_percent() {
+        let bot = crate::brain::tests::bot_at(Vec3::ZERO);
+        for id in ["diamond_sword", "diamond_axe", "diamond_pickaxe", "mace", "trident", "air", "diamond_shovel"] {
+            let stack = items::Stack::new(id, 1);
+            let full = items::weapon(id).cooldown_ticks();
+            // The swing happens on the first whole tick at or past `swing_ticks`.
+            let tick = swing_ticks(&bot, Some(&stack)).ceil();
+            assert!((tick + 0.5) / full > 0.9, "{id}: swings at tick {tick} of {full}");
+        }
     }
 
     #[test]

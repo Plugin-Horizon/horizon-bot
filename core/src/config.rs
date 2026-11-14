@@ -32,7 +32,38 @@ pub struct Config {
 
 pub const DEFAULT_MAX_BOTS: u32 = 0;
 pub const DEFAULT_BOT_VIEW_DISTANCE: u8 = 2;
-pub const DEFAULT_JOINS_PER_TICK: u32 = 5;
+pub const DEFAULT_JOINS_PER_TICK: u32 = 10;
+
+/// The wall time (milliseconds) the joins of one tick may use before the rest wait for the next tick.
+pub const JOIN_BUDGET_MS: f64 = 8.0;
+
+/// Whether one more queued bot may join in this tick: `per_tick` is the most a tick lets in, `joined`
+/// how many this tick has let in, `spent_ms` the wall time those joins used. The budget is checked
+/// after each join, so a tick's joins stop soon after they went over it; the first join of a tick
+/// is always let in (a spawn always moves on, however slow the server).
+pub fn may_join_more(per_tick: u32, joined: u32, spent_ms: f64) -> bool {
+    joined < per_tick && (joined == 0 || spent_ms <= JOIN_BUDGET_MS)
+}
+
+/// The most bots a tick lets in, given how long the last server tick took. The cost of a join shows
+/// up in the tick AFTER it was admitted (the hub handles it in its next poll), so the pace follows the
+/// tick time: `per_tick` while the server keeps up, half of it once a tick ran over 60 ms, a fifth
+/// over 150 ms; never less than one, so a spawn always moves on.
+pub fn joins_for_tick(per_tick: u32, last_tick_ms: f64) -> u32 {
+    if last_tick_ms <= 60.0 {
+        per_tick
+    } else if last_tick_ms <= 150.0 {
+        (per_tick / 2).max(1)
+    } else {
+        (per_tick / 5).max(1)
+    }
+}
+
+/// How many ticks a teleport waits for a bot that is still queued to be placed, `queued` bots being
+/// ahead of it: each tick lets in at least one, and a bot is placed a few ticks after it joined.
+pub fn placement_wait_ticks(queued: usize) -> u32 {
+    200u32.saturating_add(u32::try_from(queued).unwrap_or(u32::MAX))
+}
 
 pub const PLAYSTYLES: &[&str] = &["default", "aggressive", "safe", "defensive", "balanced", "adaptive"];
 
@@ -268,5 +299,29 @@ mod tests {
         let c = Config::parse(&out).unwrap();
         assert_eq!(c.active_preset.as_deref(), Some("x"));
         assert_eq!(c.presets["x"].get("skill"), Some(&Value::Int(1)));
+    }
+
+    #[test]
+    fn joins_stop_at_the_budget_but_never_below_one() {
+        // The first join of a tick is always let in, whatever it cost.
+        assert!(may_join_more(10, 0, 500.0));
+        assert!(may_join_more(10, 3, JOIN_BUDGET_MS));
+        assert!(!may_join_more(10, 3, JOIN_BUDGET_MS + 0.5));
+        // The per-tick cap holds however cheap the joins were.
+        assert!(may_join_more(10, 9, 0.0));
+        assert!(!may_join_more(10, 10, 0.0));
+        assert!(!may_join_more(1, 1, 0.0));
+        assert_eq!(placement_wait_ticks(0), 200);
+        assert_eq!(placement_wait_ticks(50), 250);
+    }
+
+    #[test]
+    fn the_join_pace_follows_the_tick_time() {
+        assert_eq!(joins_for_tick(10, 50.0), 10);
+        assert_eq!(joins_for_tick(10, 60.0), 10);
+        assert_eq!(joins_for_tick(10, 100.0), 5);
+        assert_eq!(joins_for_tick(10, 400.0), 2);
+        assert_eq!(joins_for_tick(1, 400.0), 1);
+        assert_eq!(joins_for_tick(3, 100.0), 1);
     }
 }

@@ -23,7 +23,18 @@ pub struct Squad {
     pub peel: BTreeMap<String, (i32, i32)>,
     /// Tethered targets (lower case): the escort's shared warning state.
     pub tethers: BTreeMap<String, TetherState>,
+    /// Path-search nodes expanded by all bots this tick (see `NAV_BUDGET_PER_TICK`).
+    pub nav_spent: u32,
 }
+
+/// The most path-search node expansions all bots together may spend in one server tick. A bot that
+/// finds the budget used up keeps its old path (or walks straight) and searches in a later tick.
+///
+/// Measured with 500 bots: 8000 nodes were ~96 000 block reads (~12 per node), 10-20 ms of every tick. 3000 is about
+/// 3-4 ms; the bots that miss out keep walking toward the goal and search a few ticks later.
+pub const NAV_BUDGET_PER_TICK: u32 = 3000;
+/// What the small searches of long-starved bots (`NAV_STARVED_TICKS`) may bring the tick's total to, at most.
+pub const NAV_HARD_CAP_PER_TICK: u32 = 4500;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TetherState {
@@ -38,6 +49,7 @@ impl Squad {
         self.last_on = std::mem::take(&mut self.now_on);
         self.factions.tick_calls();
         self.peel.clear();
+        self.nav_spent = 0;
     }
 
     pub fn relation(&self, a: Option<&str>, b: Option<&str>) -> Relation {
@@ -82,6 +94,15 @@ mod tests {
         assert_eq!(s.pile(7), 0);
         s.begin_tick(2);
         assert_eq!(s.pile(7), 2);
+    }
+
+    #[test]
+    fn nav_budget_resets_each_tick() {
+        let mut s = Squad::default();
+        s.begin_tick(1);
+        s.nav_spent = 5000;
+        s.begin_tick(2);
+        assert_eq!(s.nav_spent, 0);
     }
 
     #[test]

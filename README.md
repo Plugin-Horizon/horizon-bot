@@ -25,7 +25,7 @@ cobwebs, water buckets — in factions and armies, with kits, presets, scripts, 
 
 ## Features
 
-Bot management (spawn any number a command up to `[horizon] max-bots` in all (0 = no limit, the default), let in `joins-per-tick` (5) a tick, name tables, random skins from a pool, `latest`), selectors (`all`, `latest`,
+Bot management (spawn any number a command up to `[horizon] max-bots` in all (0 = no limit, the default), let in `joins-per-tick` (10) a tick, fewer when the joins of a tick take more than 8 ms, name tables, random skins from a pool, `latest`), selectors (`all`, `latest`,
 `faction`, `overfaction`, `random[...]`, `list:`), combat orders (attack, fight, stop, retreat, hide, tether),
 movement (follow in eleven formations, guard, patrol routes with waypoint commands, marches, pause, teleports
 including portal and pearl arrivals), detection (field of view, hearing, line of sight, memory, sneaking and
