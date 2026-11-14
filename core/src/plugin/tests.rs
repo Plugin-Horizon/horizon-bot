@@ -39,6 +39,15 @@ fn told(e: &[Effect]) -> String {
 }
 
 #[test]
+fn a_batch_comes_in_on_the_block_of_whoever_spawned_it() {
+    let mut p = plugin();
+    let e = p.command(&op(), "spawn 40");
+    let spots: Vec<Vec3> = e.iter().filter_map(|x| if let Effect::SpawnBot { pos, .. } = x { *pos } else { None }).collect();
+    assert_eq!(spots.len(), 40);
+    assert!(spots.iter().all(|s| *s == Vec3::new(0.5, 64.0, 0.5)), "{spots:?}");
+}
+
+#[test]
 fn spawns_with_offline_uuids_and_names_latest() {
     let mut p = plugin();
     let e = p.command(&op(), "spawn 5");

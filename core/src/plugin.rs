@@ -1121,18 +1121,11 @@ impl Plugin {
             _ => None,
         };
         let none = skin == SkinArg::None;
-        let n = names.len();
-        for (i, name) in names.iter().enumerate() {
-            // A batch stands in a loose ring, not on one block.
-            let at = if n > 1 {
-                let a = i as f64 / n as f64 * std::f64::consts::TAU;
-                let r = 1.5 + (n as f64).sqrt() * 0.6;
-                pos + Vec3::new(a.cos() * r, 0.0, a.sin() * r)
-            } else {
-                pos
-            };
+        for name in names.iter() {
+            // Every bot of a batch comes in on the block of whoever spawned it (a ring around them put
+            // bots into walls, where they suffocated).
             let src = self.skin_for(name, skin_from.as_deref(), none);
-            self.add_live(name, &world, at, yaw, skin_from.clone(), src, out);
+            self.add_live(name, &world, pos, yaw, skin_from.clone(), src, out);
         }
         self.latest = names.clone();
         if self.runner.running().is_some() {

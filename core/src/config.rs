@@ -34,29 +34,20 @@ pub const DEFAULT_MAX_BOTS: u32 = 0;
 pub const DEFAULT_BOT_VIEW_DISTANCE: u8 = 2;
 pub const DEFAULT_JOINS_PER_TICK: u32 = 10;
 
-/// The wall time (milliseconds) the joins of one tick may use before the rest wait for the next tick.
-pub const JOIN_BUDGET_MS: f64 = 8.0;
+/// Kept for the callers: joins are no longer held back by the time they take.
+pub const JOIN_BUDGET_MS: f64 = f64::INFINITY;
 
 /// Whether one more queued bot may join in this tick: `per_tick` is the most a tick lets in, `joined`
-/// how many this tick has let in, `spent_ms` the wall time those joins used. The budget is checked
-/// after each join, so a tick's joins stop soon after they went over it; the first join of a tick
-/// is always let in (a spawn always moves on, however slow the server).
-pub fn may_join_more(per_tick: u32, joined: u32, spent_ms: f64) -> bool {
-    joined < per_tick && (joined == 0 || spent_ms <= JOIN_BUDGET_MS)
+/// how many this tick has let in. A spawn is never slowed down by the server running late (a long
+/// tick while the bots arrive is expected; a spawn that crawls is not), so only the count holds;
+/// `_spent_ms` stays for the callers.
+pub fn may_join_more(per_tick: u32, joined: u32, _spent_ms: f64) -> bool {
+    joined < per_tick
 }
 
-/// The most bots a tick lets in, given how long the last server tick took. The cost of a join shows
-/// up in the tick AFTER it was admitted (the hub handles it in its next poll), so the pace follows the
-/// tick time: `per_tick` while the server keeps up, half of it once a tick ran over 60 ms, a fifth
-/// over 150 ms; never less than one, so a spawn always moves on.
-pub fn joins_for_tick(per_tick: u32, last_tick_ms: f64) -> u32 {
-    if last_tick_ms <= 60.0 {
-        per_tick
-    } else if last_tick_ms <= 150.0 {
-        (per_tick / 2).max(1)
-    } else {
-        (per_tick / 5).max(1)
-    }
+/// The most bots a tick lets in: always `per_tick`, however long the last server tick took.
+pub fn joins_for_tick(per_tick: u32, _last_tick_ms: f64) -> u32 {
+    per_tick
 }
 
 /// How many ticks a teleport waits for a bot that is still queued to be placed, `queued` bots being
@@ -302,12 +293,10 @@ mod tests {
     }
 
     #[test]
-    fn joins_stop_at_the_budget_but_never_below_one() {
-        // The first join of a tick is always let in, whatever it cost.
+    fn joins_stop_only_at_the_per_tick_cap() {
+        // However slow the joins were, the cap is all that holds.
         assert!(may_join_more(10, 0, 500.0));
-        assert!(may_join_more(10, 3, JOIN_BUDGET_MS));
-        assert!(!may_join_more(10, 3, JOIN_BUDGET_MS + 0.5));
-        // The per-tick cap holds however cheap the joins were.
+        assert!(may_join_more(10, 3, 5000.0));
         assert!(may_join_more(10, 9, 0.0));
         assert!(!may_join_more(10, 10, 0.0));
         assert!(!may_join_more(1, 1, 0.0));
@@ -316,12 +305,10 @@ mod tests {
     }
 
     #[test]
-    fn the_join_pace_follows_the_tick_time() {
+    fn the_join_pace_ignores_the_tick_time() {
         assert_eq!(joins_for_tick(10, 50.0), 10);
-        assert_eq!(joins_for_tick(10, 60.0), 10);
-        assert_eq!(joins_for_tick(10, 100.0), 5);
-        assert_eq!(joins_for_tick(10, 400.0), 2);
-        assert_eq!(joins_for_tick(1, 400.0), 1);
-        assert_eq!(joins_for_tick(3, 100.0), 1);
+        assert_eq!(joins_for_tick(10, 400.0), 10);
+        assert_eq!(joins_for_tick(1, 4000.0), 1);
+        assert_eq!(joins_for_tick(3, 100.0), 3);
     }
 }
