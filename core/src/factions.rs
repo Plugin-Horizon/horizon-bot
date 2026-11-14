@@ -79,6 +79,10 @@ impl Factions {
     }
 
     pub fn faction_of(&self, member: &str) -> Option<&str> {
+        // (No factions, the common case with hundreds of bots: no key to build.)
+        if self.index.is_empty() {
+            return None;
+        }
         self.index.get(&lc(member)).map(String::as_str)
     }
 

@@ -17,7 +17,7 @@ max-bots = 0  # 0 (no limit) or 1 and up
 # (it is sent, tracks and keeps loaded only this much around it). 2 is the least the server allows.
 bot-view-distance = 2  # 2 to 32
 # The most bots let in per server tick; a big spawn trickles in instead of lagging one tick.
-joins-per-tick = 5  # 1 to 1000
+joins-per-tick = 10  # 1 to 1000
 
 # Periodic checks, restarts, compatibility.
 [general]
@@ -41,7 +41,7 @@ attack-invincible = false
 max-target-distance = 28.0  # 1.0 to 128.0
 melee-range = 2.8  # 1.0 to 6.0
 melee-standoff = 2.0  # 0.5 to 5.0
-attack-cooldown = 16  # 1 to 100
+attack-cooldown = 12  # 1 to 100
 ping-millis = 42  # 0 to 500
 miss-chance = 11  # 0 to 100
 mistake-chance = 9  # 0 to 100

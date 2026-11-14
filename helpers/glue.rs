@@ -83,7 +83,7 @@ pub(super) fn logged_in(game: &mut Game<'_>, uuid: u128, name: &str) {
     // A bot is looked up in the hub directly: listing every player for each join made a join of
     // hundreds of bots quadratic (and the costly part of the tick they joined in).
     if pb::is_bot(uuid) {
-        let found = game.lan.as_ref().and_then(|h| h.hub.guests.iter().find(|g| g.uuid == uuid)).map(|g| (g.entity_id, g.position));
+        let found = game.lan.as_ref().and_then(|h| h.hub.guest_by_uuid(uuid)).map(|g| (g.entity_id, g.position));
         pb::with(|g| {
             if let (Some(plugin), Some((entity, position))) = (g.plugin.as_mut(), found) {
                 plugin.bot_joined(name, entity, Vec3::from_array(position));
@@ -91,7 +91,7 @@ pub(super) fn logged_in(game: &mut Game<'_>, uuid: u128, name: &str) {
         });
         return;
     }
-    let player = game.native_server_players().into_iter().find(|p| p.uuid == uuid);
+    let player = game.native_server_player(uuid);
     let effects = pb::with(|g| {
         let Some(plugin) = g.plugin.as_mut() else { return Vec::new() };
         match &player {
@@ -112,7 +112,7 @@ pub(super) fn logged_out(game: &mut Game<'_>, uuid: u128, name: &str) {
 
 pub(super) fn player_died(game: &mut Game<'_>, uuid: u128) {
     // The killer is the last entity that hurt them (queued damage of this tick or the last).
-    let victim = game.lan.as_ref().and_then(|h| h.hub.guests.iter().find(|g| g.uuid == uuid)).map(|g| g.entity_id);
+    let victim = game.lan.as_ref().and_then(|h| h.hub.guest_by_uuid(uuid)).map(|g| g.entity_id);
     let effects = pb::with(|g| {
         let Some(v) = victim else { return Vec::new() };
         let killer = g.queue.damage.iter().rev().find(|(e, _, _)| *e == v).map_or(0, |(_, c, _)| *c);
@@ -188,7 +188,7 @@ pub(super) fn server_tick_start(game: &mut Game<'_>) {
     if let Some(host) = game.lan.as_ref() {
         let ghosts: std::collections::BTreeSet<u128> = pb::with(|g| g.conns.iter().filter(|c| c.ghost).map(|c| c.uuid).collect());
         pb::set_ghost_entities(host.hub.guests.iter().filter(|g| ghosts.contains(&g.uuid)).map(|g| g.entity_id).collect());
-        let bypass = pb::with(|g| g.plugin.as_ref().is_some_and(|p| p.settings.snapshot(None, None).b("bypass-damage-protection")));
+        let bypass = pb::with(|g| g.plugin.as_ref().is_some_and(|p| p.settings.get("bypass-damage-protection", None, None).as_bool()));
         pb::set_bot_entities(host.hub.guests.iter().filter(|g| pb::is_bot(g.uuid)).map(|g| g.entity_id).collect(), bypass);
     }
     // The event channel of the network threads, once.
@@ -214,15 +214,16 @@ pub(super) fn server_tick_start(game: &mut Game<'_>) {
             run_effects(game, effects);
         }
     }
-    admit_queued();
+    admit_queued(game);
     mark_fake_players(game);
     horizon_client::spans::time("horizonbot_answer", || answer_server(game));
-    let players: Vec<PlayerInfo> = game
-        .native_server_players()
-        .iter()
-        .filter(|p| !pb::is_bot(p.uuid))
-        .map(info_of)
-        .collect();
+    // The real players only: a record built for each of hundreds of bots was a large part of the tick.
+    let real: Vec<u128> = game
+        .lan
+        .as_ref()
+        .map(|h| h.hub.guests.iter().filter(|g| !pb::is_bot(g.uuid)).map(|g| g.uuid).collect())
+        .unwrap_or_default();
+    let players: Vec<PlayerInfo> = real.into_iter().filter_map(|u| game.native_server_player(u)).map(|p| info_of(&p)).collect();
     // Skins that came back from their lookups.
     let mut effects = pb::with(|g| {
         let mut out = Vec::new();
@@ -286,17 +287,46 @@ pub(super) fn server_tick_start(game: &mut Game<'_>) {
     }
 }
 
-/// Lets queued bots in, at most `joins-per-tick` a tick, so a big spawn does not stall one tick.
-fn admit_queued() {
+/// Lets queued bots in: at most `joins-per-tick` a tick, and no more once the joins of this tick have
+/// used `JOIN_BUDGET_MS` of wall time (at least one a tick), so a big spawn does not stall one tick.
+fn admit_queued(game: &mut Game<'_>) {
+    // The time since this ran last = how long the last server tick took (`joins_for_tick`).
+    let last_tick_ms = LAST_ADMIT.with(|c| {
+        let now = std::time::Instant::now();
+        c.replace(Some(now)).map_or(0.0, |t| now.duration_since(t).as_secs_f64() * 1000.0)
+    });
     pb::with(|g| {
-        let k = g.plugin.as_ref().map_or(horizonbot_core::config::DEFAULT_JOINS_PER_TICK, |p| p.config.joins_per_tick) as usize;
-        for _ in 0..k {
-            let Some((name, uuid, skin)) = g.join_queue.pop_front() else { break };
+        if g.join_queue.is_empty() {
+            return;
+        }
+        let per_tick = g.plugin.as_ref().map_or(pc::config::DEFAULT_JOINS_PER_TICK, |p| p.config.joins_per_tick);
+        let per_tick = pc::config::joins_for_tick(per_tick, last_tick_ms);
+        let started = std::time::Instant::now();
+        let mut joined = 0u32;
+        while pc::config::may_join_more(per_tick, joined, started.elapsed().as_secs_f64() * 1000.0) {
+            let Some((name, uuid, skin, spawn)) = g.join_queue.pop_front() else { break };
+            // Announced before the join, so the hub makes the bot a fake player from its first packet,
+            // and places it where it was spawned (no hop from the world spawn).
+            let placed = match &spawn {
+                Some((dim, pos, yaw)) => game.native_expect_fake_player_at(&name, dim, *pos, *yaw),
+                None => game.native_expect_fake_player(&name, true),
+            };
             if !pb::connect(g, &name, uuid, skin, false) {
+                game.native_expect_fake_player(&name, false);
                 eprintln!("[horizonbot] {name} could not join");
+            } else if let (false, Some((dim, pos, _))) = (placed, &spawn) {
+                // Fallback only (the place could not be announced): a teleport once it is placed.
+                let wait = pc::config::placement_wait_ticks(g.join_queue.len());
+                g.pending_tp.push((name.clone(), dim.clone(), *pos, wait));
             }
+            joined += 1;
         }
     });
+}
+
+thread_local! {
+    /// When `admit_queued` last ran.
+    static LAST_ADMIT: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
 
 thread_local! {
@@ -312,8 +342,21 @@ fn mark_fake_players(game: &mut Game<'_>) {
     let uuids: Vec<u128> = pb::with(|g| g.conns.iter().map(|c| c.uuid).collect());
     let todo: Vec<u128> = FAKE_MARKED.with(|m| {
         let mut m = m.borrow_mut();
-        m.retain(|u| uuids.contains(u));
-        uuids.iter().copied().filter(|u| !m.contains(u)).collect()
+        let mut todo = Vec::new();
+        let mut known = 0;
+        for &u in &uuids {
+            if m.contains(&u) {
+                known += 1;
+            } else {
+                todo.push(u);
+            }
+        }
+        // Someone marked has left (the connections are all different): forget them, with a set.
+        if known < m.len() {
+            let live: std::collections::HashSet<u128> = uuids.iter().copied().collect();
+            m.retain(|u| live.contains(u));
+        }
+        todo
     });
     for u in todo {
         if game.native_set_player_fake(u, true) {
@@ -325,22 +368,23 @@ fn mark_fake_players(game: &mut Game<'_>) {
 /// Each bot's "client" handles what the server sent it: teleports are accepted, knockback taken,
 /// chunk batches acknowledged, keep-alives and pings answered, the arrival confirmed.
 fn answer_server(game: &mut Game<'_>) {
-    let entity_ids: HashMap<u128, i32> = game
-        .lan
-        .as_ref()
-        .map(|h| h.hub.guests.iter().map(|g| (g.uuid, g.entity_id)).collect())
-        .unwrap_or_default();
-    pb::with(|g| {
+    let kicked: Vec<(u128, Option<String>)> = pb::with(|g| {
         let mut out: Vec<(u32, S)> = Vec::new();
         let mut moved: Vec<(String, Option<Vec3>, Option<Vec3>)> = Vec::new();
+        let mut kicked: Vec<u128> = Vec::new();
         for c in g.conns.iter_mut() {
-            let my_id = entity_ids.get(&c.uuid).copied().unwrap_or(-1);
+            // A bot's entity id is read from the hub once (it never changes), not for every bot each tick.
+            if c.entity_id == 0 {
+                c.entity_id = game.lan.as_ref().and_then(|h| h.hub.guest_by_uuid(c.uuid)).map_or(0, |g| g.entity_id);
+            }
+            let my_id = if c.entity_id == 0 { -1 } else { c.entity_id };
             while let Ok(o) = c.rx.try_recv() {
                 let bodies = match o {
                     horizon_client::lan::Out::Packet(b) => vec![b],
                     horizon_client::lan::Out::Packets(v) => v,
                     horizon_client::lan::Out::Disconnect(_) => {
                         c.dead = true;
+                        kicked.push(c.uuid);
                         continue;
                     }
                 };
@@ -387,7 +431,23 @@ fn answer_server(game: &mut Game<'_>) {
                 plugin.moved(&name, pos, vel);
             }
         }
+        // A kicked bot's "client" closes the connection, as a real one does on the disconnect
+        // packet: the server then takes the player out and says it left (not a quiet leave).
+        kicked
+            .into_iter()
+            .map(|uuid| {
+                let name = g.plugin.as_mut().and_then(|p| p.kicked(uuid));
+                pb::disconnect(g, uuid);
+                (uuid, name)
+            })
+            .collect()
     });
+    for (uuid, name) in kicked {
+        FAKE_MARKED.with(|m| m.borrow_mut().remove(&uuid));
+        if let Some(name) = name {
+            game.native_expect_fake_player(&name, false);
+        }
+    }
 }
 
 // ------------------------------------------------------------------ a level's bots think
@@ -405,11 +465,14 @@ struct LevelView<'a, 'g> {
     game: &'a Game<'g>,
     bottom: i32,
     top: i32,
+    /// The last chunk found loaded (the level does not change while bots think): consecutive reads
+    /// mostly fall in the same chunk, so the chunk map is asked once.
+    last_chunk: std::cell::Cell<(i32, i32)>,
 }
 
 impl<'a, 'g> LevelView<'a, 'g> {
     fn new(game: &'a Game<'g>) -> Self {
-        LevelView { game, bottom: game.world.bottom_y(), top: game.world.top_y() }
+        LevelView { game, bottom: game.world.bottom_y(), top: game.world.top_y(), last_chunk: std::cell::Cell::new((i32::MAX, i32::MAX)) }
     }
 }
 
@@ -421,8 +484,12 @@ impl pc::world::BlockView for LevelView<'_, '_> {
             return pc::world::Block::air();
         }
         let world = &self.game.world;
-        if !world.chunks.contains_key(&(x >> 4, z >> 4)) {
-            return pc::world::Block::unloaded();
+        let key = (x >> 4, z >> 4);
+        if self.last_chunk.get() != key {
+            if !world.chunks.contains_key(&key) {
+                return pc::world::Block::unloaded();
+            }
+            self.last_chunk.set(key);
         }
         // VERIFY: `world.block` and `state_string` (game/agent.rs) as the level refs use them.
         let state = world.block(x, y, z);
@@ -478,108 +545,292 @@ fn mob_shape(kind: &str) -> (f64, f64, bool, bool) {
     (w, h, hostile, !hostile)
 }
 
+/// A bot as a level's tick sees it: who it is, its connection, its name in lower case (the plugin's
+/// key) and where its connection sat in `Glue::conns` when the tick began (checked before it is used).
+struct BotRef {
+    uuid: u128,
+    conn: u32,
+    name: String,
+    key: String,
+    slot: usize,
+}
+
+thread_local! {
+    /// What each bot knows of itself, kept from tick to tick: its inventory view is rebuilt only when
+    /// the inventory changed (the fingerprint), not allocated afresh for 68 slots every tick.
+    static SELVES: RefCell<HashMap<u128, (u64, SelfView)>> = RefCell::new(HashMap::new());
+}
+
+fn mix(h: u64, x: u64) -> u64 {
+    (h.rotate_left(5) ^ x).wrapping_mul(0x517c_c1b7_2722_0a95)
+}
+
+fn mix_str(mut h: u64, s: &str) -> u64 {
+    let mut b = s.as_bytes();
+    while b.len() >= 8 {
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&b[..8]);
+        h = mix(h, u64::from_le_bytes(a));
+        b = &b[8..];
+    }
+    for &x in b {
+        h = mix(h, u64::from(x));
+    }
+    mix(h, s.len() as u64)
+}
+
+/// A fingerprint of what `build_inventory` reads from a slot (item, count, damage, enchantments, potion).
+fn slot_fp(h: u64, s: &Option<horizon_client::items::ItemStack>) -> u64 {
+    let Some(s) = s else { return mix(h, 0) };
+    let mut h = mix_str(mix(h, 1), &s.item);
+    h = mix(mix(h, s.count as u64), s.damage as u64);
+    if let Some(x) = &s.extra {
+        for (e, l) in x.enchantments.iter() {
+            h = mix(mix_str(h, e), *l as u64);
+        }
+        if let Some(p) = &x.potion {
+            h = mix_str(mix(h, 2), p);
+        }
+    }
+    h
+}
+
+/// A fingerprint of everything `build_inventory` reads, without allocating.
+fn inventory_fp(
+    inv: &[Option<horizon_client::items::ItemStack>],
+    armor: &[Option<horizon_client::items::ItemStack>],
+    offhand: &Option<horizon_client::items::ItemStack>,
+    selected: usize,
+    ender: &[Option<horizon_client::items::ItemStack>],
+) -> u64 {
+    let mut h = mix(0, selected as u64);
+    for s in inv.iter().take(36).chain(armor.iter()) {
+        h = slot_fp(h, s);
+    }
+    h = slot_fp(h, offhand);
+    for s in ender.iter().take(27) {
+        h = slot_fp(h, s);
+    }
+    mix(h, (inv.len() + ender.len()) as u64)
+}
+
+/// The brain's view of a guest's inventory.
+fn build_inventory(
+    slots: &[Option<horizon_client::items::ItemStack>],
+    armor: &[Option<horizon_client::items::ItemStack>],
+    offhand: &Option<horizon_client::items::ItemStack>,
+    selected: usize,
+    ender: &[Option<horizon_client::items::ItemStack>],
+) -> pc::brain::inventory::Inventory {
+    let mut inv = pc::brain::inventory::Inventory::new();
+    for (i, s) in slots.iter().enumerate().take(36) {
+        inv.slots[i] = s.as_ref().map(stack_of);
+    }
+    // The guest's armour is head..feet (`Guest::armor`); the brain's feet first.
+    for (i, s) in armor.iter().enumerate() {
+        inv.armor[3 - i] = s.as_ref().map(stack_of);
+    }
+    inv.offhand = offhand.as_ref().map(stack_of);
+    inv.selected = selected;
+    for (i, s) in ender.iter().enumerate().take(27) {
+        inv.ender[i] = s.as_ref().map(stack_of);
+    }
+    inv
+}
+
+/// How far a bot hears sprinting players (`events_for`).
+const HEARD_REACH: f64 = 33.0;
+
+/// Adds the player named `name` (any case) to `out`, if one is on. The name table is made on first use.
+fn add_named(names: &mut Option<HashMap<String, u32>>, seen: &[Seen], players: &[u32], name: &str, out: &mut Vec<u32>) {
+    let table = names.get_or_insert_with(|| {
+        let mut m: HashMap<String, u32> = HashMap::new();
+        for &i in players {
+            m.entry(seen[i as usize].name.to_ascii_lowercase()).or_insert(i);
+        }
+        m
+    });
+    if let Some(&i) = table.get(&name.to_ascii_lowercase()) {
+        out.push(i);
+    }
+}
+
+/// Adds the player with entity id `id` to `out`, if one is on.
+fn add_id(seen: &[Seen], by_id: &HashMap<i32, u32>, id: i32, out: &mut Vec<u32>) {
+    if let Some(&i) = by_id.get(&id) {
+        if seen[i as usize].is_player {
+            out.push(i);
+        }
+    }
+}
+
+/// The players a bot perceives however far they are: the brain looks them up by name or id
+/// (`Perception::by_name` / `get`: its orders, its faction's leader and calls, who hurt it, its fight
+/// target) and would otherwise find nobody past its reach. Everyone else only matters within reach.
+#[allow(clippy::too_many_arguments)]
+fn explicit_players(
+    plugin: &pc::plugin::Plugin,
+    key: &str,
+    seen: &[Seen],
+    players: &[u32],
+    by_id: &HashMap<i32, u32>,
+    events: &[Event],
+    names: &mut Option<HashMap<String, u32>>,
+    out: &mut Vec<u32>,
+) {
+    let Some(live) = plugin.bots.get(key) else { return };
+    let bot = &live.bot;
+    if let Some(n) = &bot.orders.attack {
+        add_named(names, seen, players, n, out);
+    }
+    if let Some(t) = &bot.orders.tether {
+        add_named(names, seen, players, &t.target, out);
+        add_named(names, seen, players, &t.leader, out);
+    }
+    if let Some(r) = &bot.orders.retreat {
+        if let pc::brain::RetreatTo::Player(n) = &r.to {
+            add_named(names, seen, players, n, out);
+        }
+    }
+    if let Some(m) = &bot.orders.march {
+        if let pc::brain::MarchTo::Player(n) = &m.to {
+            add_named(names, seen, players, n, out);
+        }
+    }
+    if let Some(f) = &bot.orders.follow {
+        add_named(names, seen, players, &f.target, out);
+    }
+    if let Some(f) = bot.faction.as_deref() {
+        if let Some(l) = plugin.squad.factions.leader_of(f) {
+            add_named(names, seen, players, l, out);
+        }
+        for (k, _) in plugin.squad.factions.calls.iter() {
+            if k.0 == f {
+                add_named(names, seen, players, &k.1, out);
+            }
+        }
+    }
+    if let Some((id, _)) = bot.revenge {
+        add_id(seen, by_id, id, out);
+    }
+    if let Some(id) = bot.fight.target {
+        add_id(seen, by_id, id, out);
+    }
+    for e in events {
+        match e {
+            Event::Hurt { by, .. } | Event::Heard { by, .. } => add_id(seen, by_id, *by, out),
+            Event::Landed { entity } => add_id(seen, by_id, *entity, out),
+            _ => {}
+        }
+    }
+}
+
 /// `level_tick_pre`: the bots in this level think and act (mobs and blocks are readable only
 /// with the level in place).
 pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
     if game.lan.is_none() {
         return;
     }
-    let (tick, bots, damage): (u64, Vec<(u128, u32, String)>, Vec<(i32, i32, f32)>) =
-        pb::with(|g| (g.tick, g.conns.iter().filter(|c| !c.ghost).map(|c| (c.uuid, c.conn, c.name.clone())).collect(), g.last_damage.clone()));
+    let (tick, bots, damage): (u64, Vec<BotRef>, Vec<(i32, i32, f32)>) = pb::with(|g| {
+        (
+            g.tick,
+            g.conns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !c.ghost)
+                .map(|(slot, c)| BotRef { uuid: c.uuid, conn: c.conn, name: c.name.clone(), key: c.key.clone(), slot })
+                .collect(),
+            g.last_damage.clone(),
+        )
+    });
     if bots.is_empty() {
         return;
     }
     // What everyone can see: the players (bots too) of this level and its mobs.
     let perceive_span = horizon_client::spans::guard("horizonbot_perceive");
     let mut seen: Vec<Seen> = Vec::new();
-    let mut selves: HashMap<u128, SelfView> = HashMap::new();
+    let mut selves: HashMap<u128, (u64, SelfView)> = SELVES.with(|s| std::mem::take(&mut *s.borrow_mut()));
     let mut ground: Vec<Ground> = Vec::new();
     {
         let Some(host) = game.lan.as_ref() else { return };
-        let factions = pb::with(|g| g.plugin.as_ref().map(|p| p.squad.factions.clone()));
-        for gst in host.hub.guests.iter().filter(|g| g.placed && g.dimension == dimension) {
-            let effects = gst.effects.saved(); // VERIFY: PlayerEffects::saved
-            let held = gst.inventory.get(gst.selected).and_then(Option::as_ref).map(|s| s.item.to_string());
-            let offhand = gst.offhand.as_ref().map(|s| s.item.to_string());
-            let armor: f64 = gst
-                .armor
-                .iter()
-                .flatten()
-                .filter_map(|s| pc::items::armor(&s.item).map(|(_, p, _)| p))
-                .sum();
-            let is_bot = pb::is_bot(gst.uuid);
-            seen.push(Seen {
-                id: gst.entity_id,
-                uuid: gst.uuid,
-                name: gst.name.clone(),
-                kind: "minecraft:player".into(),
-                is_player: true,
-                is_bot,
-                faction: factions.as_ref().and_then(|f| f.faction_of(&gst.name).map(str::to_owned)),
-                pos: Vec3::from_array(gst.position),
-                vel: Vec3::from_array(gst.position) - Vec3::from_array(gst.previous_position),
-                yaw: gst.yaw,
-                pitch: gst.pitch,
-                on_ground: gst.on_ground,
-                health: gst.health,
-                max_health: 20.0,
-                armor,
-                totem_shown: held.as_deref() == Some("minecraft:totem_of_undying") || offhand.as_deref() == Some("minecraft:totem_of_undying"),
-                // GAP: no "is blocking" on a guest; a shield in hand while using is the best read.
-                blocking: offhand.as_deref() == Some("minecraft:shield") && gst.living_flags & 1 != 0,
-                sneaking: gst.sneaking,
-                sprinting: gst.sprinting,
-                invisible: effects.iter().any(|e| e.id.ends_with("invisibility")),
-                gliding: gst.fall_flying,
-                game_mode: gst.game_mode,
-                held,
-                offhand,
-                hostile: false,
-                passive: false,
-                width: 0.6,
-                height: if gst.sneaking { 1.5 } else { 1.8 },
-                eye_height: if gst.sneaking { 1.27 } else { 1.62 },
-                swung: false,
-                using: gst.living_flags & 1 != 0,
-            });
-            if is_bot {
-                let mut inv = pc::brain::inventory::Inventory::new();
-                for (i, s) in gst.inventory.iter().enumerate().take(36) {
-                    inv.slots[i] = s.as_ref().map(stack_of);
+        // The glue stays locked while the guests are read (nothing in the loop takes it): the factions
+        // are borrowed, not cloned every tick.
+        pb::with(|glue| {
+            let factions = glue.plugin.as_ref().map(|p| &p.squad.factions);
+            for gst in host.hub.guests.iter().filter(|g| g.placed && g.dimension == dimension) {
+                let effects = gst.effects.saved(); // VERIFY: PlayerEffects::saved
+                let held = gst.inventory.get(gst.selected).and_then(Option::as_ref).map(|s| s.item.to_string());
+                let offhand = gst.offhand.as_ref().map(|s| s.item.to_string());
+                let armor: f64 = gst
+                    .armor
+                    .iter()
+                    .flatten()
+                    .filter_map(|s| pc::items::armor(&s.item).map(|(_, p, _)| p))
+                    .sum();
+                let is_bot = pb::is_bot(gst.uuid);
+                seen.push(Seen {
+                    id: gst.entity_id,
+                    uuid: gst.uuid,
+                    name: gst.name.clone(),
+                    // (The brain never reads a player's kind: no string to make.)
+                    kind: String::new(),
+                    is_player: true,
+                    is_bot,
+                    faction: factions.and_then(|f| f.faction_of(&gst.name).map(str::to_owned)),
+                    pos: Vec3::from_array(gst.position),
+                    vel: Vec3::from_array(gst.position) - Vec3::from_array(gst.previous_position),
+                    yaw: gst.yaw,
+                    pitch: gst.pitch,
+                    on_ground: gst.on_ground,
+                    health: gst.health,
+                    max_health: 20.0,
+                    armor,
+                    totem_shown: held.as_deref() == Some("minecraft:totem_of_undying") || offhand.as_deref() == Some("minecraft:totem_of_undying"),
+                    // GAP: no "is blocking" on a guest; a shield in hand while using is the best read.
+                    blocking: offhand.as_deref() == Some("minecraft:shield") && gst.living_flags & 1 != 0,
+                    sneaking: gst.sneaking,
+                    sprinting: gst.sprinting,
+                    invisible: effects.iter().any(|e| e.id.ends_with("invisibility")),
+                    gliding: gst.fall_flying,
+                    game_mode: gst.game_mode,
+                    held,
+                    offhand,
+                    hostile: false,
+                    passive: false,
+                    width: 0.6,
+                    height: if gst.sneaking { 1.5 } else { 1.8 },
+                    eye_height: if gst.sneaking { 1.27 } else { 1.62 },
+                    swung: false,
+                    using: gst.living_flags & 1 != 0,
+                });
+                if is_bot {
+                    // The bot's view of itself is kept: only what changes every tick is written again, and
+                    // the inventory only when its fingerprint changed.
+                    let fp = inventory_fp(&gst.inventory, &gst.armor, &gst.offhand, gst.selected, &gst.ender_items);
+                    let (old_fp, view) = selves.entry(gst.uuid).or_insert_with(|| (!fp, SelfView::default()));
+                    if *old_fp != fp {
+                        view.inventory = build_inventory(&gst.inventory, &gst.armor, &gst.offhand, gst.selected, &gst.ender_items);
+                        *old_fp = fp;
+                    }
+                    view.health = gst.health;
+                    view.absorption = gst.saved_absorption.unwrap_or(0.0);
+                    view.food = gst.food;
+                    view.saturation = gst.saturation;
+                    view.effects.clear();
+                    // SelfView::effects is (id, amplifier, ticks left): the amplifier comes first.
+                    view.effects.extend(effects.iter().map(|e| (e.id.trim_start_matches("minecraft:").to_owned(), e.amplifier.max(0) as u32, e.duration.max(0) as u32)));
+                    view.game_mode = gst.game_mode;
+                    // VERIFY: `PlayerMotion::fire_ticks` (as `SavedBody::of` reads it).
+                    view.on_fire = gst.motion.as_ref().is_some_and(|m| m.fire_ticks > 0);
+                    // GAP: item cooldowns of a guest are not read here (the map stays empty).
+                    if view.dimension != gst.dimension {
+                        view.dimension = gst.dimension.clone();
+                    }
+                    view.dead = gst.dead;
+                    view.invulnerable = false;
                 }
-                // The guest's armour is head..feet (`Guest::armor`); the brain's feet first.
-                for (i, s) in gst.armor.iter().enumerate() {
-                    inv.armor[3 - i] = s.as_ref().map(stack_of);
-                }
-                inv.offhand = gst.offhand.as_ref().map(stack_of);
-                inv.selected = gst.selected;
-                for (i, s) in gst.ender_items.iter().enumerate().take(27) {
-                    inv.ender[i] = s.as_ref().map(stack_of);
-                }
-                selves.insert(
-                    gst.uuid,
-                    SelfView {
-                        health: gst.health,
-                        absorption: gst.saved_absorption.unwrap_or(0.0),
-                        food: gst.food,
-                        saturation: gst.saturation,
-                        effects: effects
-                            .iter()
-                            // SelfView::effects is (id, amplifier, ticks left): the amplifier comes first.
-                            .map(|e| (e.id.trim_start_matches("minecraft:").to_owned(), e.amplifier.max(0) as u32, e.duration.max(0) as u32))
-                            .collect(),
-                        inventory: inv,
-                        game_mode: gst.game_mode,
-                        // VERIFY: `PlayerMotion::fire_ticks` (as `SavedBody::of` reads it).
-                        on_fire: gst.motion.as_ref().is_some_and(|m| m.fire_ticks > 0),
-                        cooldowns: Default::default(), // GAP: item cooldowns of a guest are not read here
-                        dimension: gst.dimension.clone(),
-                        dead: gst.dead,
-                        invulnerable: false,
-                    },
-                );
             }
-        }
+        });
     }
     for m in game.native_mobs(dimension) {
         let (w, h, hostile, passive) = mob_shape(&m.kind);
@@ -601,30 +852,48 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
             ..Default::default()
         });
     }
-    // Items on the ground near any bot (after-fight looting): one scan of the level's items, not one
-    // per bot (each scan walks every dropped item).
-    let bot_spots: Vec<Vec3> = bots.iter().filter_map(|(u, _, _)| seen.iter().find(|s| s.uuid == *u).map(|s| s.pos)).collect();
-    // VERIFY: native_item_entities(dimension, min, max) (API 41).
-    for it in game.native_item_entities(dimension, [-3.0e7, -4096.0, -3.0e7], [3.0e7, 4096.0, 3.0e7]) {
-        let at = Vec3::from_array(it.position);
-        if bot_spots.iter().any(|b| (at.x - b.x).abs() <= 8.0 && (at.y - b.y).abs() <= 4.0 && (at.z - b.z).abs() <= 8.0) {
-            ground.push(Ground { id: it.id as i32, item: it.stack.item.to_string(), count: it.stack.count, pos: at });
-        }
-    }
-    // Who each bot perceives is a list of indices into `seen`, so no bot copies the others:
-    // every player and bot (they are looked up by name, and a leader can be far away), and the
-    // mobs within the bot's reach, from a grid of the mobs.
+    // Who each bot perceives is a list of indices into `seen`, so no bot copies the others: the
+    // players and the mobs within the bot's reach (and the few it must know of by name or id, however
+    // far), from a grid of each.
     let mut player_idx: Vec<u32> = Vec::new();
+    let mut player_grid: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
     let mut mob_grid: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
     let mut by_id: HashMap<i32, u32> = HashMap::new();
     let mut by_uuid: HashMap<u128, u32> = HashMap::new();
     for (i, s) in seen.iter().enumerate() {
         by_id.insert(s.id, i as u32);
+        let cell = ((s.pos.x.floor() as i32) >> 4, (s.pos.z.floor() as i32) >> 4);
         if s.is_player {
             player_idx.push(i as u32);
             by_uuid.insert(s.uuid, i as u32);
+            player_grid.entry(cell).or_default().push(i as u32);
         } else {
-            mob_grid.entry(((s.pos.x.floor() as i32) >> 4, (s.pos.z.floor() as i32) >> 4)).or_default().push(i as u32);
+            mob_grid.entry(cell).or_default().push(i as u32);
+        }
+    }
+    // Items on the ground near any bot (after-fight looting): one scan of the level's items, not one
+    // per bot (each scan walks every dropped item). A bot within 8 blocks of an item is at most one
+    // 16-block cell away from it, so only the item's cell and its neighbours are asked.
+    let mut spot_grid: HashMap<(i32, i32), Vec<Vec3>> = HashMap::new();
+    for b in &bots {
+        if let Some(&i) = by_uuid.get(&b.uuid) {
+            let at = seen[i as usize].pos;
+            spot_grid.entry(((at.x.floor() as i32) >> 4, (at.z.floor() as i32) >> 4)).or_default().push(at);
+        }
+    }
+    // VERIFY: native_item_entities(dimension, min, max) (API 41).
+    for it in game.native_item_entities(dimension, [-3.0e7, -4096.0, -3.0e7], [3.0e7, 4096.0, 3.0e7]) {
+        let at = Vec3::from_array(it.position);
+        let (cx, cz) = ((at.x.floor() as i32) >> 4, (at.z.floor() as i32) >> 4);
+        let near = (cx - 1..=cx + 1).any(|x| {
+            (cz - 1..=cz + 1).any(|z| {
+                spot_grid.get(&(x, z)).is_some_and(|spots| {
+                    spots.iter().any(|b| (at.x - b.x).abs() <= 8.0 && (at.y - b.y).abs() <= 4.0 && (at.z - b.z).abs() <= 8.0)
+                })
+            })
+        });
+        if near {
+            ground.push(Ground { id: it.id as i32, item: it.stack.item.to_string(), count: it.stack.count, pos: at });
         }
     }
     // Where whoever struck last tick stood, for the bots that hear it: (victim, striker, position).
@@ -633,22 +902,49 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
     // Think.
     let think_span = horizon_client::spans::guard("horizonbot_think");
     let view = LevelView::new(game);
-    let decisions: Vec<(u128, u32, pc::brain::Decision, Vec3, bool, bool)> = pb::guarded("the bots' turn", |g| {
+    let decisions: Vec<(usize, pc::brain::Decision, Vec3, bool, bool)> = pb::guarded("the bots' turn", |g| {
         let mut out = Vec::new();
         let Some(plugin) = g.plugin.as_mut() else { return out };
         let mut idx: Vec<u32> = Vec::new();
-        for (uuid, conn, name) in &bots {
-            let Some(me) = selves.get(uuid) else { continue };
-            let Some(&mine) = by_uuid.get(uuid) else { continue };
-            plugin.bot_world(name, dimension);
+        let mut near: Vec<u32> = Vec::new();
+        let mut extra: Vec<u32> = Vec::new();
+        let mut names: Option<HashMap<String, u32>> = None;
+        for (bi, b) in bots.iter().enumerate() {
+            let Some((_, me)) = selves.get(&b.uuid) else { continue };
+            let Some(&mine) = by_uuid.get(&b.uuid) else { continue };
+            plugin.bot_world(&b.name, dimension);
             let my_pos = seen[mine as usize].pos;
-            // How far a bot perceives mobs: the farthest it can notice one, and a margin.
-            let reach = plugin
-                .bots
-                .get(&name.to_ascii_lowercase())
-                .map_or(48.0, |l| l.bot.settings.f("max-target-distance").max(16.0) + 16.0);
+            // How far a bot perceives: the farthest it can notice a target, and a margin.
+            let reach = plugin.bots.get(&b.key).map_or(48.0, |l| l.bot.settings.f("max-target-distance").max(16.0) + 16.0);
+            // The players near it (and, for what it hears, a little farther), in the order of `seen`.
+            let ask = reach.max(HEARD_REACH);
+            near.clear();
+            let (p0x, p1x) = (((my_pos.x - ask).floor() as i32) >> 4, ((my_pos.x + ask).floor() as i32) >> 4);
+            let (p0z, p1z) = (((my_pos.z - ask).floor() as i32) >> 4, ((my_pos.z + ask).floor() as i32) >> 4);
+            let mut cells = 0;
+            for cx in p0x..=p1x {
+                for cz in p0z..=p1z {
+                    if let Some(cell) = player_grid.get(&(cx, cz)) {
+                        near.extend_from_slice(cell);
+                        cells += 1;
+                    }
+                }
+            }
+            if cells > 1 {
+                near.sort_unstable();
+            }
+            let t_events = std::time::Instant::now();
+            let events = events_for(&seen, &near, &heard, mine, &damage);
+            pc::brain::prof_add(pc::brain::P_GLUE_EVENTS, t_events.elapsed().as_nanos() as u64);
             idx.clear();
-            idx.extend(player_idx.iter().copied().filter(|&i| i != mine));
+            idx.extend(near.iter().copied().filter(|&i| i != mine && seen[i as usize].pos.distance(my_pos) <= reach));
+            extra.clear();
+            explicit_players(plugin, &b.key, &seen, &player_idx, &by_id, &events, &mut names, &mut extra);
+            if !extra.is_empty() {
+                idx.extend(extra.iter().copied().filter(|&i| i != mine));
+                idx.sort_unstable();
+                idx.dedup();
+            }
             let (c0x, c1x) = (((my_pos.x - reach).floor() as i32) >> 4, ((my_pos.x + reach).floor() as i32) >> 4);
             let (c0z, c1z) = (((my_pos.z - reach).floor() as i32) >> 4, ((my_pos.z + reach).floor() as i32) >> 4);
             for cx in c0x..=c1x {
@@ -658,24 +954,37 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
                     }
                 }
             }
-            let events = horizon_client::spans::time("horizonbot_events", || events_for(&seen, &player_idx, &heard, mine, &damage));
             let p = Perception { tick, me, others: pc::brain::Others::indexed(&seen, &idx), ground: &ground, events: &events, world: &view };
-            if let Some(d) = horizon_client::spans::time("horizonbot_brain", || plugin.think(name, &p)) {
-                let body = &plugin.bots[&name.to_ascii_lowercase()].bot.body;
-                out.push((*uuid, *conn, d, body.pos, body.on_ground, body.horizontal_collision));
+            // (Per-bot spans cost a clock read, a CPU-time read and a push each, 500 times a tick: a counter instead.)
+            let t_brain = std::time::Instant::now();
+            let thought = plugin.think(&b.name, &p);
+            pc::brain::prof_add(pc::brain::P_GLUE_BRAIN, t_brain.elapsed().as_nanos() as u64);
+            if let Some(d) = thought {
+                let body = &plugin.bots[&b.key].bot.body;
+                out.push((bi, d, body.pos, body.on_ground, body.horizontal_collision));
             }
         }
         out
     });
     drop(view);
+    selves.retain(|u, _| pb::is_bot(*u));
+    SELVES.with(|s| *s.borrow_mut() = selves);
     horizon_client::spans::counters(&[("horizonbot_block_reads", BLOCK_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed))]);
-    horizon_client::spans::counters(&[("horizonbot_body_us", pc::brain::PROF_NS[0].swap(0, std::sync::atomic::Ordering::Relaxed) / 1000), ("horizonbot_target_us", pc::brain::PROF_NS[1].swap(0, std::sync::atomic::Ordering::Relaxed) / 1000)]);
+    horizon_client::spans::counters(&pc::brain::prof_take());
     drop(think_span);
     // Act: the packets a client sends this tick, in a client's order.
-    for (uuid, conn, d, pos, on_ground, hcol) in decisions {
-        let (pos, on_ground, hcol) = horizon_client::spans::time("horizonbot_engine", || engine_move(game, uuid, &bots, &d)).unwrap_or((pos, on_ground, hcol));
-        horizon_client::spans::time("horizonbot_act", || act(game, uuid, conn, d, pos, on_ground, hcol));
+    let act_span = horizon_client::spans::guard("horizonbot_engine_act");
+    for (bi, d, pos, on_ground, hcol) in decisions {
+        let b = &bots[bi];
+        let t_engine = std::time::Instant::now();
+        let moved = engine_move(game, b, &d);
+        pc::brain::prof_add(pc::brain::P_GLUE_ENGINE, t_engine.elapsed().as_nanos() as u64);
+        let (pos, on_ground, hcol) = moved.unwrap_or((pos, on_ground, hcol));
+        let t_act = std::time::Instant::now();
+        act(game, b, d, pos, on_ground, hcol);
+        pc::brain::prof_add(pc::brain::P_GLUE_ACT, t_act.elapsed().as_nanos() as u64);
     }
+    drop(act_span);
 }
 
 thread_local! {
@@ -688,9 +997,9 @@ thread_local! {
 /// API player_bots) instead of the core's physics model: the core's body takes the engine's
 /// answer, so the brain plans from where vanilla's physics put it. None (the core's step stays)
 /// where the engine can't play it (riding, a spectator, out of reach).
-fn engine_move(game: &mut Game<'_>, uuid: u128, bots: &[(u128, u32, String)], d: &pc::brain::Decision) -> Option<(Vec3, bool, bool)> {
-    let name = bots.iter().find(|b| b.0 == uuid)?.2.to_ascii_lowercase();
-    let at = game.lan.as_ref()?.hub.guests.iter().find(|g| g.uuid == uuid).map(|g| Vec3::from_array(g.position))?;
+fn engine_move(game: &mut Game<'_>, b: &BotRef, d: &pc::brain::Decision) -> Option<(Vec3, bool, bool)> {
+    let uuid = b.uuid;
+    let at = game.lan.as_ref()?.hub.guest_by_uuid(uuid).map(|g| Vec3::from_array(g.position))?;
     // The velocity of the last engine tick, while the bot is still where that tick left it
     // (a teleport or a setback starts again from the server's copy).
     let velocity = ENGINE_MOVES.with(|m| m.borrow().get(&uuid).filter(|(pos, _)| (*pos - at).length() < 1.0e-3).map(|(_, v)| *v));
@@ -711,7 +1020,7 @@ fn engine_move(game: &mut Game<'_>, uuid: u128, bots: &[(u128, u32, String)], d:
     let pos = Vec3::from_array(m.position);
     ENGINE_MOVES.with(|e| e.borrow_mut().insert(uuid, (pos, m.velocity)));
     pb::with(|g| {
-        if let Some(live) = g.plugin.as_mut().and_then(|p| p.bots.get_mut(&name)) {
+        if let Some(live) = g.plugin.as_mut().and_then(|p| p.bots.get_mut(&b.key)) {
             let body = &mut live.bot.body;
             body.pos = pos;
             body.vel = Vec3::from_array(m.velocity);
@@ -758,7 +1067,8 @@ fn face_dir(face: u8) -> i32 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn act(game: &mut Game<'_>, uuid: u128, conn: u32, d: pc::brain::Decision, pos: Vec3, on_ground: bool, hcol: bool) {
+fn act(game: &mut Game<'_>, b: &BotRef, d: pc::brain::Decision, pos: Vec3, on_ground: bool, hcol: bool) {
+    let (uuid, conn, slot) = (b.uuid, b.conn, b.slot);
     let mut packets: Vec<S> = Vec::new();
     let mut direct: Vec<Action> = Vec::new();
     // Slot changes first (a client sends them before the click that uses them).
@@ -768,17 +1078,17 @@ fn act(game: &mut Game<'_>, uuid: u128, conn: u32, d: pc::brain::Decision, pos: 
         }
     }
     let flags = d.input.flags();
-    let (sprint_was, input_was) = pb::with(|g| g.conns.iter().find(|c| c.conn == conn).map_or((false, 0), |c| (c.sprinting, c.input)));
+    let (sprint_was, input_was) = pb::with(|g| pb::conn_slot(g, conn, slot).map_or((false, 0), |i| (g.conns[i].sprinting, g.conns[i].input)));
     if flags != input_was {
         packets.push(S::PlayerInput(play::PlayerInput { flags }));
     }
     if d.input.sprint != sprint_was {
-        let entity = game.lan.as_ref().and_then(|h| h.hub.guests.iter().find(|g| g.uuid == uuid)).map_or(0, |g| g.entity_id);
+        let entity = game.lan.as_ref().and_then(|h| h.hub.guest_by_uuid(uuid)).map_or(0, |g| g.entity_id);
         packets.push(S::PlayerCommand(play::PlayerCommand { id: entity, action: if d.input.sprint { 1 } else { 2 }, data: 0 }));
     }
     let move_flags = u8::from(on_ground) | (u8::from(hcol) << 1);
     packets.push(S::MovePlayerPosRot(play::MovePlayerPosRot { x: pos.x, y: pos.y, z: pos.z, yaw: d.yaw, pitch: d.pitch, flags: move_flags }));
-    let seq = || pb::with(|g| pb::next_sequence(g, conn));
+    let seq = || pb::with(|g| pb::next_sequence_at(g, conn, slot));
     for a in d.actions {
         match a {
             Action::SelectSlot(_) => {}
@@ -802,7 +1112,7 @@ fn act(game: &mut Game<'_>, uuid: u128, conn: u32, d: pc::brain::Decision, pos: 
             Action::Drop { all } => packets.push(S::PlayerAction(play::PlayerAction { action: if all { 4 } else { 5 }, pos: [0, 0, 0], direction: 0, sequence: 0 })),
             Action::Respawn => packets.push(S::ClientCommand(play::ClientCommand { action: 0 })),
             Action::Glide => {
-                let entity = game.lan.as_ref().and_then(|h| h.hub.guests.iter().find(|g| g.uuid == uuid)).map_or(0, |g| g.entity_id);
+                let entity = game.lan.as_ref().and_then(|h| h.hub.guest_by_uuid(uuid)).map_or(0, |g| g.entity_id);
                 packets.push(S::PlayerCommand(play::PlayerCommand { id: entity, action: 6, data: 0 }));
             }
             Action::Sneak(_) => {}
@@ -812,12 +1122,12 @@ fn act(game: &mut Game<'_>, uuid: u128, conn: u32, d: pc::brain::Decision, pos: 
             Action::ToOffhand(_) | Action::ToHotbar { .. } | Action::SwapSlots(..) | Action::Wear(_) | Action::Unwear(_) | Action::TakeFrom { .. } => direct.push(a),
             Action::CloseContainer => {
                 // VERIFY: the window a guest has open (`Guest::next_window` counts them up).
-                let window = game.lan.as_ref().and_then(|h| h.hub.guests.iter().find(|g| g.uuid == uuid)).map_or(0, |g| g.next_window);
+                let window = game.lan.as_ref().and_then(|h| h.hub.guest_by_uuid(uuid)).map_or(0, |g| g.next_window);
                 packets.push(S::ContainerClose(play::ContainerClose { container: window }));
             }
             Action::Chat(text) => {
                 // GAP: a bot's signed chat; shown as a system line under its name.
-                let name = pb::with(|g| g.conns.iter().find(|c| c.conn == conn).map(|c| c.name.clone()).unwrap_or_default());
+                let name = &b.name;
                 game.native_broadcast(Text::literal(&format!("<{name}> {text}")));
             }
             Action::Console(line) => {
@@ -827,9 +1137,9 @@ fn act(game: &mut Game<'_>, uuid: u128, conn: u32, d: pc::brain::Decision, pos: 
     }
     packets.push(S::ClientTickEnd(horizon_protocol::packets::Empty));
     pb::with(|g| {
-        if let Some(c) = g.conns.iter_mut().find(|c| c.conn == conn) {
-            c.input = flags;
-            c.sprinting = d.input.sprint;
+        if let Some(i) = pb::conn_slot(g, conn, slot) {
+            g.conns[i].input = flags;
+            g.conns[i].sprinting = d.input.sprint;
         }
         for p in packets {
             pb::send(g, conn, p);
@@ -932,6 +1242,26 @@ fn move_items(game: &mut Game<'_>, uuid: u128, moves: &[Action]) {
 fn run_effects(game: &mut Game<'_>, effects: Vec<Effect>) {
     for e in effects {
         run_effect(game, e);
+    }
+    drain_kits(game);
+}
+
+thread_local! {
+    /// Kits waiting to be given: (bot, kit), in the order they were asked for.
+    static KIT_QUEUE: RefCell<std::collections::VecDeque<(String, pc::kits::Kit)>> = RefCell::new(std::collections::VecDeque::new());
+}
+
+/// Gives queued kits for at most `KIT_BUDGET_MS` of wall time per call (at least one), so a kit for hundreds of
+/// bots is spread over a few seconds instead of one long tick. Runs at the end of every `run_effects`, which
+/// the tick start calls each tick.
+const KIT_BUDGET_MS: f64 = 5.0;
+fn drain_kits(game: &mut Game<'_>) {
+    let started = std::time::Instant::now();
+    while let Some((to, kit)) = KIT_QUEUE.with(|q| q.borrow_mut().pop_front()) {
+        give_kit(game, &to, &kit);
+        if started.elapsed().as_secs_f64() * 1000.0 >= KIT_BUDGET_MS {
+            break;
+        }
     }
 }
 
@@ -1050,21 +1380,12 @@ fn run_effect(game: &mut Game<'_>, e: Effect) {
                 SkinSource::Known(s) => Some((s.value.clone(), s.signature.clone())),
                 SkinSource::None => None,
             };
-            // Let in a few per tick (`joins-per-tick`), see `admit_queued`.
-            pb::with(|g| g.join_queue.push_back((name.clone(), uuid, skin)));
-            // Where it was spawned: once placed, a teleport there (GAP: no spawn position for a
-            // joining player).
-            if let Some(p) = pos {
-                let dim = dimension(&world.clone().unwrap_or_else(|| "minecraft:overworld".into()));
-                pb::with(|g| {
-                    let k = g.plugin.as_ref().map_or(1, |p| p.config.joins_per_tick.max(1)) as usize;
-                    let wait = (g.join_queue.len() / k) as u32;
-                    g.pending_tp.push((name.clone(), dim, p.to_array(), 200 + wait))
-                });
-                let _ = yaw;
-            }
+            // Let in a few per tick (`joins-per-tick`), see `admit_queued`. It appears where it was spawned
+            // (the hub places it there when it joins): the queue carries the place.
+            let spawn = pos.map(|p| (dimension(&world.clone().unwrap_or_else(|| "minecraft:overworld".into())), p.to_array(), yaw));
+            pb::with(|g| g.join_queue.push_back((name.clone(), uuid, skin, spawn)));
         }
-        Effect::RemoveBot { name: _, uuid } => {
+        Effect::RemoveBot { name, uuid } => {
             // Quiet: no "left the game" for a bot.
             if let Some(host) = game.lan.as_mut() {
                 if let Some(g) = host.hub.guests.iter_mut().find(|g| g.uuid == uuid) {
@@ -1072,10 +1393,12 @@ fn run_effect(game: &mut Game<'_>, e: Effect) {
                 }
             }
             pb::with(|g| {
-                g.join_queue.retain(|(_, u, _)| *u != uuid);
+                g.join_queue.retain(|(_, u, _, _)| *u != uuid);
                 pb::disconnect(g, uuid)
             });
             FAKE_MARKED.with(|m| m.borrow_mut().remove(&uuid));
+            // The bot is gone: its name is no longer announced as a fake player.
+            game.native_expect_fake_player(&name, false);
         }
         Effect::Console(line) => {
             if !game.native_run_command(&line) {
@@ -1085,7 +1408,7 @@ fn run_effect(game: &mut Game<'_>, e: Effect) {
         Effect::AsPlayer { uuid, line } => {
             // GAP: no "run as this player" helper; `execute as` carries their name and position,
             // not their permission.
-            let name = game.native_server_players().into_iter().find(|p| p.uuid == uuid).map(|p| p.name);
+            let name = game.native_server_player(uuid).map(|p| p.name);
             if let Some(n) = name {
                 game.native_run_command(&format!("execute as {n} at {n} run {line}"));
             }
@@ -1096,7 +1419,8 @@ fn run_effect(game: &mut Game<'_>, e: Effect) {
                 game.native_run_command(&format!("execute in {dim} run setblock {x} {y} {z} {state}"));
             }
         }
-        Effect::GiveKit { to, kit } => give_kit(game, &to, &kit),
+        // Queued, not run here: a kit is ~60 vanilla commands per bot, and 500 bots in one tick took ~500 ms.
+            Effect::GiveKit { to, kit } => KIT_QUEUE.with(|q| q.borrow_mut().push_back((to, kit))),
         Effect::Teleport { name, world, pos } => {
             let dim = dimension(&world.unwrap_or_else(|| "minecraft:overworld".into()));
             teleport_by_name(game, &name, &dim, [pos.x, pos.y, pos.z]);
@@ -1123,10 +1447,21 @@ fn run_effect(game: &mut Game<'_>, e: Effect) {
                 SkinSource::Known(s) => Some((s.value.clone(), s.signature.clone())),
                 SkinSource::None => None,
             };
+            // Announced before the join, as for the bots (`admit_queued`), with the place it appears at.
+            let at = dimension(world);
+            let placed = game.native_expect_fake_player_at(name, &at, pos.to_array(), 0.0);
+            if !placed {
+                game.native_expect_fake_player(name, true);
+            }
             if pb::with(|g| pb::connect(g, name, uuid, skin, true)) {
-                pb::with(|g| g.pending_tp.push((name.clone(), dimension(world), pos.to_array(), 200)));
+                if !placed {
+                    // Fallback only: a teleport once it is placed.
+                    pb::with(|g| g.pending_tp.push((name.clone(), at, pos.to_array(), 200)));
+                }
                 // GAP: invulnerable, untouchable and out of the tab list need hooks a guest lacks.
                 game.native_run_command(&format!("effect give {name} resistance infinite 255 true"));
+            } else {
+                game.native_expect_fake_player(name, false);
             }
         }
         Effect::MoveGhost { name, pos, yaw, pitch, sneaking } => {
@@ -1352,7 +1687,7 @@ pub(super) fn menu_clicked(game: &mut Game<'_>, uuid: u128, slot: i32, button: i
     if kit_editor_clicked(game, uuid, slot) {
         return;
     }
-    let Some(player) = game.native_server_players().into_iter().find(|p| p.uuid == uuid) else { return };
+    let Some(player) = game.native_server_player(uuid) else { return };
     let who = Who::Player(info_of(&player));
     let Ok(slot) = usize::try_from(slot) else { return };
     let (effects, menu) = pb::with(|g| g.plugin.as_mut().map(|p| p.menu_click(&who, slot, button == 1)).unwrap_or((Vec::new(), None)));
@@ -1422,7 +1757,13 @@ fn read_kit(game: &Game<'_>, name: &str) -> Option<pc::kits::Kit> {
 /// moves it, from any hook, keeping its rotation, instead of an `execute in .. run tp` line by
 /// name. Falls back to the command for a name that is not on.
 fn teleport_by_name(game: &mut Game<'_>, name: &str, dim: &str, pos: [f64; 3]) {
-    let player = game.native_server_players().into_iter().find(|p| p.name.eq_ignore_ascii_case(name));
+    // A bot is found through its connection, not by listing every player.
+    let key = name.to_ascii_lowercase();
+    let bot = pb::with(|g| g.conns.iter().find(|c| c.key == key).map(|c| c.uuid));
+    let player = match bot {
+        Some(u) => game.native_server_player(u),
+        None => game.native_server_players().into_iter().find(|p| p.name.eq_ignore_ascii_case(name)),
+    };
     match player {
         // VERIFY: signature (uuid, dimension, pos, yaw, pitch) per the hooks-all PR body.
         Some(p) => {

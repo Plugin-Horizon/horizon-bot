@@ -373,6 +373,16 @@ fn horizon_section_is_read() {
     let c = crate::config::Config::parse("[horizon]\nmax-bots = 12\nbot-view-distance = 1\n").unwrap();
     assert_eq!((c.max_bots, c.bot_view_distance), (12, 2));
     assert_eq!(crate::config::Config::parse(crate::config::DEFAULT_TOML).unwrap().max_bots, 0);
-    assert_eq!(crate::config::Config::parse(crate::config::DEFAULT_TOML).unwrap().joins_per_tick, 5);
+    assert_eq!(crate::config::Config::parse(crate::config::DEFAULT_TOML).unwrap().joins_per_tick, 10);
     assert_eq!(crate::config::Config::parse("[horizon]\njoins-per-tick = 9\n").unwrap().joins_per_tick, 9);
+}
+
+#[test]
+fn a_kicked_bot_is_forgotten() {
+    let mut p = plugin();
+    let e = p.command(&op(), "spawn Marco none");
+    let uuid = e.iter().find_map(|x| if let Effect::SpawnBot { uuid, .. } = x { Some(*uuid) } else { None }).unwrap();
+    assert_eq!(p.kicked(uuid).as_deref(), Some("Marco"));
+    assert!(p.bots.is_empty());
+    assert_eq!(p.kicked(uuid), None);
 }

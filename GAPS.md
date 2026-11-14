@@ -14,9 +14,8 @@ helper or field that would replace a workaround; together they are meant as one 
   public and shaped as now.
 - [ ] A quiet join: `Joined.quiet: bool` (or `Guest.quiet_join`), checked where the join is announced — needed for "bots
   never broadcast a join message" — today: not possible (the leave is quiet through `Guest.quiet_leave`).
-- [ ] The spawn point of a joining player: `Joined.position: Option<(String, [f64; 3], f32)>` — needed for a bot to
-  appear where it was spawned — today: it is placed at the world spawn (or its saved position) and teleported there by
-  `/execute in .. run tp` once placed (a visible hop).
+- [x] The spawn point of a joining player — done with the engine call `native_expect_fake_player_at(name, dimension, pos,
+  yaw)`: the bot appears where it was spawned, no hop (the teleport after placement stays only as a fallback).
 - [ ] `Shared::admit_virtual(uuid, name)`: into the online list without the login gate — needed for the server list's
   player count and duplicate-login handling to include bots — today: skipped (`try_admit` would apply the whitelist
   and the player cap to bots).

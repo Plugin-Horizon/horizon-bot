@@ -21,6 +21,10 @@ pub struct BotConn {
     pub conn: u32,
     pub uuid: u128,
     pub name: String,
+    /// `name` in lower case, the plugin's key for the bot (made once, not every tick).
+    pub key: String,
+    /// The player's entity id once known (0 until then): it never changes while the bot is on.
+    pub entity_id: i32,
     pub ghost: bool,
     /// What the server sends this "client": decoded and answered by the tick.
     pub rx: Receiver<Out>,
@@ -67,8 +71,9 @@ pub struct Glue {
     pub last_damage: Vec<(i32, i32, f32)>,
     /// Teleports for bots not placed yet: (name, dimension, position, ticks left to try).
     pub pending_tp: Vec<(String, String, [f64; 3], u32)>,
-    /// Bots admitted a few per tick (`joins-per-tick`): (name, uuid, skin).
-    pub join_queue: std::collections::VecDeque<(String, u128, Option<(String, String)>)>,
+    /// Bots admitted a few per tick (`joins-per-tick`): (name, uuid, skin, where it appears:
+    /// dimension, position, yaw; None where no place is known).
+    pub join_queue: std::collections::VecDeque<(String, u128, Option<(String, String)>, Option<(String, [f64; 3], f32)>)>,
 }
 
 impl Default for Glue {
@@ -281,6 +286,8 @@ pub fn connect(g: &mut Glue, name: &str, uuid: u128, skin: Option<(String, Strin
         conn,
         uuid,
         name: name.to_owned(),
+        key: name.to_ascii_lowercase(),
+        entity_id: 0,
         ghost,
         rx,
         sequence: 0,
@@ -313,10 +320,27 @@ pub fn disconnect(g: &mut Glue, uuid: u128) {
     set_bot(uuid, false);
 }
 
+/// Where the connection `conn` sits in `g.conns`: `hint` (its place when the caller last looked)
+/// is tried first, so a lookup per bot per tick does not scan every bot.
+pub fn conn_slot(g: &Glue, conn: u32, hint: usize) -> Option<usize> {
+    if g.conns.get(hint).is_some_and(|c| c.conn == conn) {
+        return Some(hint);
+    }
+    g.conns.iter().position(|c| c.conn == conn)
+}
+
 /// Next use-item sequence of a bot.
 pub fn next_sequence(g: &mut Glue, conn: u32) -> i32 {
-    g.conns.iter_mut().find(|c| c.conn == conn).map_or(0, |c| {
-        c.sequence += 1;
-        c.sequence
-    })
+    next_sequence_at(g, conn, usize::MAX)
+}
+
+/// `next_sequence` with the place of the connection in `g.conns` as the caller knows it.
+pub fn next_sequence_at(g: &mut Glue, conn: u32, hint: usize) -> i32 {
+    match conn_slot(g, conn, hint) {
+        Some(i) => {
+            g.conns[i].sequence += 1;
+            g.conns[i].sequence
+        }
+        None => 0,
+    }
 }

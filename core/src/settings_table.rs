@@ -18,7 +18,7 @@ pub const SPECS: &[Spec] = &[
     Spec { key: "max-target-distance", group: "combat", yaml: "max-target-distance", kind: Num(28.0, 1.0, 128.0) },
     Spec { key: "melee-range", group: "combat", yaml: "melee-range", kind: Num(2.8, 1.0, 6.0) },
     Spec { key: "melee-standoff", group: "combat", yaml: "melee-standoff", kind: Num(2.0, 0.5, 5.0) },
-    Spec { key: "attack-cooldown", group: "combat", yaml: "attack-cooldown", kind: Int(16, 1, 100) },
+    Spec { key: "attack-cooldown", group: "combat", yaml: "attack-cooldown", kind: Int(12, 1, 100) },
     Spec { key: "ping-millis", group: "combat", yaml: "ping-millis", kind: Int(42, 0, 500) },
     Spec { key: "miss-chance", group: "combat", yaml: "miss-chance", kind: Int(11, 0, 100) },
     Spec { key: "mistake-chance", group: "combat", yaml: "mistake-chance", kind: Int(9, 0, 100) },

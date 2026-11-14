@@ -440,6 +440,10 @@ pub struct Bot {
     pub faction: Option<String>,
     pub spawned_tick: u64,
     pub fight: FightMemory,
+    /// The item id it meant to hold in melee last tick: a different one restarts the swing meter.
+    pub last_held: Option<String>,
+    /// The item id really in the hand last tick: a switch outside melee (food, a pearl) restarts the meter too.
+    pub seen_held: Option<String>,
     pub busy: Option<Busy>,
     /// Entities noticed: id -> (first seen tick, attack allowed from tick).
     pub noticed: BTreeMap<i32, (u64, u64)>,
@@ -458,11 +462,23 @@ pub struct Bot {
     pub path: Vec<nav::Pos>,
     pub path_goal: Option<nav::Pos>,
     pub path_age: u64,
+    /// Tick of the last path search (any outcome), for the minimum interval between searches.
+    pub last_search: u64,
+    /// Search nodes this bot may still expand this tick (the squad's shared budget), and how many it used.
+    pub nav_left: usize,
+    pub nav_used: usize,
+    /// Tick since which a due search waits for the shared budget (0 = not waiting).
+    pub nav_waiting_since: u64,
+    /// What the squad's hard cap still allows this tick (a starved bot's small search is paid from it too).
+    pub nav_hard_left: usize,
+    /// No new search for the same unreachable goal before this tick (a search that failed or ran its whole
+    /// budget without arriving), unless the goal has moved far.
+    pub search_backoff_until: u64,
     /// The last straight-walk check: (feet, goal block, tick, result). It costs a block read per sample along
     /// the line, so it is reused for a few ticks while the bot and its goal stay about where they were.
     pub direct_cache: Option<(nav::Pos, nav::Pos, u64, bool)>,
     /// Line of sight to others as last looked up: id -> (tick, seen). Reused for a few ticks.
-    pub sight_cache: std::cell::RefCell<BTreeMap<i32, (u64, bool)>>,
+    pub sight_cache: std::cell::RefCell<BTreeMap<i32, SightEntry>>,
     /// The last search found no way to `path_goal`: not searched again until it is stale (a search
     /// that fails walks its whole budget, and with nothing to follow one ran every tick).
     pub path_failed: bool,
@@ -499,6 +515,9 @@ pub struct Bot {
     pub aim_err: [f32; 2],
 }
 
+/// A line of sight as looked up: (tick, seen, eye of the bot, eye of the other).
+pub type SightEntry = (u64, bool, Vec3, Vec3);
+
 /// A streak of hits taken or landed is forgotten after this many quiet ticks.
 pub const STREAK_TICKS: u64 = 60;
 
@@ -516,6 +535,21 @@ pub enum Regear {
     /// Mining it back up, until.
     Mining { pos: [i32; 3], until: u64 },
 }
+
+/// Minimum ticks between two path searches of one bot (with a path in hand / without one), plus up
+/// to `NAV_SPACING_JITTER - 1` more ticks by uuid.
+pub const NAV_SPACING: u64 = 10;
+pub const NAV_SPACING_EMPTY: u64 = 4;
+pub const NAV_SPACING_JITTER: u64 = 6;
+/// A search is not started with less than this many nodes left in the tick's shared budget.
+pub const NAV_MIN_BUDGET: usize = 300;
+/// A bot whose search waited this long for the shared budget searches anyway (a small search), so the
+/// bots late in the tick's order are not starved while the early ones use the budget up.
+pub const NAV_STARVED_TICKS: u64 = 20;
+pub const NAV_STARVED_BUDGET: usize = 800;
+/// Nodes one search may expand: a first search toward a new goal, and a repeat toward about the same one.
+pub const NAV_FIRST_BUDGET: usize = 2500;
+pub const NAV_REPEAT_BUDGET: usize = 1000;
 
 impl Bot {
     pub fn new(name: &str, uuid: u128, at: Vec3, yaw: f32, settings: Snapshot, tick: u64) -> Bot {
@@ -541,6 +575,8 @@ impl Bot {
             faction: None,
             spawned_tick: tick,
             fight: FightMemory { strafe_sign: 1.0, ..Default::default() },
+            last_held: None,
+            seen_held: None,
             busy: None,
             noticed: BTreeMap::new(),
             known: BTreeMap::new(),
@@ -552,6 +588,12 @@ impl Bot {
             path: Vec::new(),
             path_goal: None,
             path_age: 0,
+            last_search: 0,
+            nav_left: usize::MAX,
+            nav_used: 0,
+            nav_waiting_since: 0,
+            nav_hard_left: usize::MAX,
+            search_backoff_until: 0,
             direct_cache: None,
             sight_cache: Default::default(),
             path_failed: false,
@@ -678,6 +720,12 @@ impl Bot {
     /// Movement toward a point (keys relative to where the bot looks), with pathfinding when the
     /// straight line is blocked.
     pub fn walk_to(&mut self, p: &Perception, d: &mut Decision, goal: Vec3, sprint: bool) {
+        let t_walk = std::time::Instant::now();
+        self.walk_to_inner(p, d, goal, sprint);
+        prof_add(P_WALK, t_walk.elapsed().as_nanos() as u64);
+    }
+
+    fn walk_to_inner(&mut self, p: &Perception, d: &mut Decision, goal: Vec3, sprint: bool) {
         let here = self.body.pos;
         let mut aim_point = goal;
         let feet = here.block();
@@ -692,7 +740,10 @@ impl Bot {
                     r
                 }
                 _ => {
+                    let t_direct = std::time::Instant::now();
                     let r = nav::straight_walkable(p.world, feet, [goal_b[0], feet[1], goal_b[2]]);
+                    prof_add(P_DIRECT, t_direct.elapsed().as_nanos() as u64);
+                    prof_add(P_N_DIRECT, 1);
                     if far {
                         self.direct_cache = Some((feet, goal_b, p.tick, r));
                     }
@@ -701,23 +752,86 @@ impl Bot {
             }
         };
         if !direct && here.horizontal_distance(goal) > 1.5 {
-            let stale = self.path_goal.is_none_or(|g| {
-                let dg = [g[0] - goal_b[0], g[1] - goal_b[1], g[2] - goal_b[2]];
-                dg[0].abs() + dg[1].abs() + dg[2].abs() > 2
-            });
+            // The goal moved too far for the old path to still lead there. "Too far" grows with the
+            // distance: a target 40 blocks away that stepped 3 blocks is still where the path points.
+            let reach_here = here.horizontal_distance(goal);
+            let tolerance = ((reach_here / 5.0) as i32).clamp(2, 10);
+            let moved_beyond = |tol: i32| {
+                self.path_goal.is_none_or(|g| {
+                    let dg = [g[0] - goal_b[0], g[1] - goal_b[1], g[2] - goal_b[2]];
+                    dg[0].abs() + dg[1].abs() + dg[2].abs() > tol
+                })
+            };
+            let stale = moved_beyond(tolerance);
             // A search that found nothing is not repeated soon, and then with a smaller budget: it
             // walks the whole budget (thousands of block reads) each time. Swimming bots search not
             // at all (no cell in water is standable); they swim straight.
             let retry_after = if self.path_failed { 120 } else { 40 };
-            if !self.body.in_water
-                && (stale || p.tick > self.path_age + retry_after || (self.path.is_empty() && !self.path_failed))
-            {
-                let budget = if self.path_failed { 800 } else { 3000 };
-                let found = nav::find_path(p.world, feet, goal_b, 1.5, budget).map(|r| nav::smooth(p.world, &r));
+            // Searches of one bot are spaced apart, each bot on its own phase (so they don't all land on
+            // the same tick). With nothing to follow the wait is short.
+            let spacing = if self.path.is_empty() { NAV_SPACING_EMPTY } else { NAV_SPACING };
+            let due = self.last_search == 0 || p.tick >= self.last_search + spacing + (self.uuid % NAV_SPACING_JITTER as u128) as u64;
+            // While the last search for this goal failed or ran its whole budget (`search_backoff_until`), only a
+            // goal that moved three times as far wakes it: a moving target no path leads to (on a pillar, over a
+            // wall) made every bot search again every 10-15 ticks and find nothing again.
+            let wants = if p.tick < self.search_backoff_until {
+                moved_beyond(tolerance * 3)
+            } else {
+                stale || p.tick > self.path_age + retry_after || (self.path.is_empty() && !self.path_failed)
+            };
+            let ready = !self.body.in_water && wants && due;
+            let starved = ready && self.nav_waiting_since > 0 && p.tick >= self.nav_waiting_since + NAV_STARVED_TICKS && self.nav_hard_left >= NAV_STARVED_BUDGET;
+            if ready && self.nav_left < NAV_MIN_BUDGET && !starved {
+                if self.nav_waiting_since == 0 {
+                    self.nav_waiting_since = p.tick.max(1);
+                }
+            }
+            if ready && (self.nav_left >= NAV_MIN_BUDGET || starved) {
+                self.nav_waiting_since = 0;
+                // A first search toward a goal may walk a long way round (NAV_FIRST_BUDGET); a repeat toward the same
+                // place (the old path's goal is still within the tolerance, so only the target's walk or the retry
+                // timer asked) only has to repair the route: a smaller budget, it normally ends within a few hundred nodes.
+                // (After a hopeless partial route the next search is a first one again, so a long detour goes on a stretch at a time.)
+                let repeat = !self.path_failed && self.path_goal.is_some() && !stale && self.search_backoff_until == 0;
+                let budget = if starved && self.nav_left < NAV_STARVED_BUDGET {
+                    NAV_STARVED_BUDGET
+                } else {
+                    (if self.path_failed { 800 } else if repeat { NAV_REPEAT_BUDGET } else { NAV_FIRST_BUDGET }).min(self.nav_left)
+                };
+                let t_search = std::time::Instant::now();
+                let (r, used) = nav::find_path_counted(p.world, feet, goal_b, 1.5, budget);
+                prof_add(P_SEARCH, t_search.elapsed().as_nanos() as u64);
+                prof_add(P_N_SEARCH, 1);
+                prof_add(P_N_NODES, used as u64);
+                if starved {
+                    prof_add(P_N_STARVED, 1);
+                }
+                if repeat {
+                    prof_add(P_N_REPEAT, 1);
+                }
+                self.nav_left = self.nav_left.saturating_sub(used);
+                self.nav_hard_left = self.nav_hard_left.saturating_sub(used);
+                self.nav_used += used;
+                // Ran the whole (not squeezed) budget and did not arrive: the goal is out of reach or far round.
+                let hopeless = used > budget && budget >= 800;
+                let t_smooth = std::time::Instant::now();
+                let found = r.map(|r| nav::smooth(p.world, &r));
+                prof_add(P_SMOOTH, t_smooth.elapsed().as_nanos() as u64);
                 self.path_failed = found.is_none();
+                if found.is_none() {
+                    self.search_backoff_until = p.tick + 60;
+                    prof_add(P_N_FAILED, 1);
+                } else if hopeless {
+                    // The partial route toward the closest point is still followed; the next search from there waits.
+                    self.search_backoff_until = p.tick + 40;
+                    prof_add(P_N_HOPELESS, 1);
+                } else {
+                    self.search_backoff_until = 0;
+                }
                 self.path = found.unwrap_or_default();
                 self.path_goal = Some(goal_b);
                 self.path_age = p.tick;
+                self.last_search = p.tick.max(1);
             }
             while let Some(next) = self.path.first() {
                 let c = Vec3::new(next[0] as f64 + 0.5, next[1] as f64, next[2] as f64 + 0.5);
@@ -848,6 +962,16 @@ impl Bot {
 
     /// One tick of the brain. `squad` is what the bots share.
     pub fn tick(&mut self, p: &Perception, squad: &mut squad::Squad) -> Decision {
+        self.nav_left = squad::NAV_BUDGET_PER_TICK.saturating_sub(squad.nav_spent) as usize;
+        self.nav_hard_left = squad::NAV_HARD_CAP_PER_TICK.saturating_sub(squad.nav_spent) as usize;
+        self.nav_used = 0;
+        prof_add(P_N_BOTS, 1);
+        let d = self.tick_inner(p, squad);
+        squad.nav_spent = squad.nav_spent.saturating_add(self.nav_used as u32);
+        d
+    }
+
+    fn tick_inner(&mut self, p: &Perception, squad: &mut squad::Squad) -> Decision {
         let mut d = Decision {
             yaw: self.body.yaw,
             pitch: self.body.pitch,
@@ -861,56 +985,83 @@ impl Bot {
         }
         self.stuck_ticks = if self.body.pos.horizontal_distance(self.last_pos) < 0.02 { self.stuck_ticks + 1 } else { 0 };
         self.last_pos = self.body.pos;
+        let mut t = std::time::Instant::now();
         self.take_events(p);
+        lap(&mut t, P_EVENTS);
         if self.orders.paused || self.ghost {
             d.mode = if self.ghost { "ghost" } else { "paused" };
             return self.finish(p, d);
+        }
+        let now = p.me.inventory.held().map_or("", |s| s.id.as_str());
+        if self.seen_held.as_deref() != Some(now) {
+            // Melee already restarted the meter for a swap it chose (last_held); any other switch restarts it here.
+            if self.seen_held.is_some() && self.last_held.as_deref() != Some(now) {
+                self.fight.since_swing = 0;
+                self.last_held = Some(now.to_owned());
+            }
+            self.seen_held = Some(now.to_owned());
         }
         self.fight.since_swing = self.fight.since_swing.saturating_add(1);
 
         // Survival first: the clutch moves win over everything.
         if survival::clutch(self, p, &mut d) {
+            lap(&mut t, P_SURV);
             return self.finish(p, d);
         }
         if survival::web_escape(self, p, &mut d) || team::chorus_escape(self, p, &mut d) || team::fire_escape(self, p, &mut d) {
+            lap(&mut t, P_SURV);
             return self.finish(p, d);
         }
         survival::totem(self, p, &mut d);
         if survival::continue_busy(self, p, &mut d) {
+            lap(&mut t, P_SURV);
             return self.finish(p, d);
         }
         survival::auto_equip(self, p, &mut d);
+        lap(&mut t, P_SURV);
 
         let t_target = std::time::Instant::now();
         let target = combat::choose_target(self, p, squad);
-        PROF_NS[1].fetch_add(t_target.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        prof_add(P_TARGET, t_target.elapsed().as_nanos() as u64);
+        t = std::time::Instant::now();
         if survival::heal(self, p, &mut d, target.as_ref()) {
+            lap(&mut t, P_HEAL);
             return self.finish(p, d);
         }
         if survival::eat(self, p, &mut d, target.as_ref()) {
+            lap(&mut t, P_HEAL);
             return self.finish(p, d);
         }
         if survival::drain(self, p, &mut d) || team::heal_ally(self, p, &mut d, squad) {
+            lap(&mut t, P_HEAL);
             return self.finish(p, d);
         }
+        lap(&mut t, P_HEAL);
         if regear::regear(self, p, &mut d, target.as_ref(), squad) {
+            lap(&mut t, P_REGEAR);
             return self.finish(p, d);
         }
+        lap(&mut t, P_REGEAR);
 
         if survival::hide(self, p, &mut d) {
+            lap(&mut t, P_ORDERS);
             return self.finish(p, d);
         }
         // Orders that outrank fighting.
         if let Some(r) = self.orders.retreat.clone() {
             if combat::retreat(self, p, &mut d, &r, target.as_ref()) {
+                lap(&mut t, P_ORDERS);
                 return self.finish(p, d);
             }
         }
         if self.orders.tether.is_some() && combat::tether(self, p, &mut d, squad) {
+            lap(&mut t, P_ORDERS);
             return self.finish(p, d);
         }
-        if let Some(t) = target {
-            combat::fight(self, p, &mut d, &t, squad);
+        lap(&mut t, P_ORDERS);
+        if let Some(tg) = target {
+            combat::fight(self, p, &mut d, &tg, squad);
+            lap(&mut t, P_FIGHT);
             return self.finish(p, d);
         }
         if matches!(self.busy, Some(Busy::Drawing { .. })) {
@@ -921,15 +1072,20 @@ impl Bot {
         self.fight = FightMemory { strafe_sign: self.fight.strafe_sign, since_swing: self.fight.since_swing, ..Default::default() };
 
         if survival::buff(self, p, &mut d) || team::repair(self, p, &mut d) {
+            lap(&mut t, P_POSITIONAL);
             return self.finish(p, d);
         }
         if combat::positional_orders(self, p, &mut d) {
+            lap(&mut t, P_POSITIONAL);
             return self.finish(p, d);
         }
         if survival::after_fight(self, p, &mut d) {
+            lap(&mut t, P_POSITIONAL);
             return self.finish(p, d);
         }
+        lap(&mut t, P_POSITIONAL);
         combat::idle(self, p, &mut d);
+        lap(&mut t, P_IDLE);
         self.finish(p, d)
     }
 
@@ -993,6 +1149,7 @@ impl Bot {
     /// Runs the physics with the decided keys and releases actions whose ping has passed.
     fn finish(&mut self, p: &Perception, mut d: Decision) -> Decision {
         let tick = p.tick;
+        let t_finish = std::time::Instant::now();
         // Hiding without a potion: crouched the whole time.
         if self.orders.hide && !self.hidden_with_potion && !matches!(d.mode, "fight") {
             d.input.sneak = true;
@@ -1022,7 +1179,7 @@ impl Bot {
         }
         let t_body = std::time::Instant::now();
         self.body.tick(&d.input, p.world);
-        PROF_NS[0].fetch_add(t_body.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        prof_add(P_BODY, t_body.elapsed().as_nanos() as u64);
         let mut late = Vec::new();
         while self.outbox.front().is_some_and(|(due, _)| *due <= tick) {
             late.push(self.outbox.pop_front().unwrap().1);
@@ -1030,12 +1187,100 @@ impl Bot {
         // Delayed attacks go out after this tick's slot changes.
         d.actions.extend(late);
         self.last_mode = d.mode;
+        prof_add(P_FINISH, t_finish.elapsed().as_nanos() as u64);
         d
     }
 }
 
-/// Profiling: nanoseconds spent in the body's own physics step (0) and in the target choice (1).
-pub static PROF_NS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// Profiling (read and reset by the glue once a tick through `prof_take`): nanoseconds per section of one
+/// bot's tick, summed over all bots (`P_BODY`..`P_EVENTS`; `P_WALK` contains `P_SEARCH`, `P_SMOOTH` and
+/// `P_DIRECT`, and `P_FIGHT`, `P_ORDERS`, `P_IDLE` contain walks and sight lines), then plain counts.
+pub const P_BODY: usize = 0;
+pub const P_TARGET: usize = 1;
+pub const P_SURV: usize = 2;
+pub const P_HEAL: usize = 3;
+pub const P_REGEAR: usize = 4;
+pub const P_ORDERS: usize = 5;
+pub const P_FIGHT: usize = 6;
+pub const P_POSITIONAL: usize = 7;
+pub const P_IDLE: usize = 8;
+pub const P_FINISH: usize = 9;
+pub const P_WALK: usize = 10;
+pub const P_SEARCH: usize = 11;
+pub const P_SMOOTH: usize = 12;
+pub const P_SIGHT: usize = 13;
+pub const P_DIRECT: usize = 14;
+pub const P_EVENTS: usize = 15;
+pub const P_N_SEARCH: usize = 16;
+pub const P_N_NODES: usize = 17;
+pub const P_N_FAILED: usize = 18;
+pub const P_N_HOPELESS: usize = 19;
+pub const P_N_STARVED: usize = 20;
+pub const P_N_REPEAT: usize = 21;
+pub const P_N_BOTS: usize = 22;
+pub const P_N_DIRECT: usize = 23;
+/// Per-bot totals the glue measures around the plugin's `think` (everything a bot's brain tick costs, so
+/// `P_GLUE_BRAIN` minus the sections above is what is not in any of them), around its events lookup, and
+/// around its engine move and its packets (`act`).
+pub const P_GLUE_BRAIN: usize = 24;
+pub const P_GLUE_EVENTS: usize = 25;
+pub const P_GLUE_ENGINE: usize = 26;
+pub const P_GLUE_ACT: usize = 27;
+const PROF_LEN: usize = 28;
+pub static PROF_NS: [std::sync::atomic::AtomicU64; PROF_LEN] = [const { std::sync::atomic::AtomicU64::new(0) }; PROF_LEN];
+const PROF_NAMES: [&str; PROF_LEN] = [
+    "horizonbot_body_us",
+    "horizonbot_target_us",
+    "horizonbot_surv_us",
+    "horizonbot_heal_us",
+    "horizonbot_regear_us",
+    "horizonbot_orders_us",
+    "horizonbot_fight_us",
+    "horizonbot_positional_us",
+    "horizonbot_idle_us",
+    "horizonbot_finish_us",
+    "horizonbot_walk_us",
+    "horizonbot_search_us",
+    "horizonbot_smooth_us",
+    "horizonbot_sight_us",
+    "horizonbot_direct_us",
+    "horizonbot_takeevents_us",
+    "horizonbot_n_searches",
+    "horizonbot_n_search_nodes",
+    "horizonbot_n_search_failed",
+    "horizonbot_n_search_hopeless",
+    "horizonbot_n_search_starved",
+    "horizonbot_n_search_repeat",
+    "horizonbot_n_bots_ticked",
+    "horizonbot_n_direct_checks",
+    "horizonbot_brain_us",
+    "horizonbot_events_us",
+    "horizonbot_engine_us",
+    "horizonbot_act_us",
+];
+
+#[inline]
+pub fn prof_add(i: usize, v: u64) {
+    PROF_NS[i].fetch_add(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Everything counted since the last call, reset: nanosecond sections in microseconds (`_us`), counts as they are.
+pub fn prof_take() -> Vec<(&'static str, u64)> {
+    (0..PROF_LEN)
+        .map(|i| {
+            let v = PROF_NS[i].swap(0, std::sync::atomic::Ordering::Relaxed);
+            (PROF_NAMES[i], if PROF_NAMES[i].ends_with("_us") { v / 1000 } else { v })
+        })
+        .collect()
+}
+
+/// Adds the time since `*t` to section `i` and restarts the lap.
+#[inline]
+fn lap(t: &mut std::time::Instant, i: usize) {
+    let now = std::time::Instant::now();
+    prof_add(i, now.duration_since(*t).as_nanos() as u64);
+    *t = now;
+}
 
 pub fn effect_level(me: &SelfView, id: &str) -> u32 {
     me.effects.iter().find(|(e, _, _)| e == id).map_or(0, |(_, a, _)| a + 1)

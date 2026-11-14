@@ -40,9 +40,36 @@ pub fn specs() -> impl Iterator<Item = &'static Spec> {
     crate::settings_table::SPECS.iter().chain(EXTRA.iter())
 }
 
-fn index() -> &'static HashMap<&'static str, usize> {
-    static INDEX: OnceLock<HashMap<&'static str, usize>> = OnceLock::new();
+/// FNV-1a for the setting-name index: a lookup by name runs hundreds of times per bot per tick, and the
+/// standard hasher (SipHash) costs about twice as much on these short keys.
+#[derive(Clone, Copy)]
+pub struct KeyHasher(u64);
+impl Default for KeyHasher {
+    fn default() -> Self {
+        KeyHasher(0xcbf2_9ce4_8422_2325)
+    }
+}
+impl std::hash::Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+}
+type KeyMap = HashMap<&'static str, usize, std::hash::BuildHasherDefault<KeyHasher>>;
+
+fn index() -> &'static KeyMap {
+    static INDEX: OnceLock<KeyMap> = OnceLock::new();
     INDEX.get_or_init(|| specs().enumerate().map(|(i, s)| (s.key, i)).collect())
+}
+
+/// Every spec's default, in table order (what a snapshot starts from).
+fn defaults() -> &'static Vec<Value> {
+    static DEFAULTS: OnceLock<Vec<Value>> = OnceLock::new();
+    DEFAULTS.get_or_init(|| all().iter().map(|s| s.default_value()).collect())
 }
 
 fn all() -> &'static Vec<&'static Spec> {
@@ -625,9 +652,20 @@ impl Settings {
 
     /// The resolved values for one bot, typed and indexed for its tick.
     pub fn snapshot(&self, faction: Option<&str>, bot: Option<&str>) -> Snapshot {
-        let values = all().iter().map(|s| self.get(s.key, faction, bot)).collect();
+        // Same answer as `get` for every key (the highest layer holding the key wins, coerced; else the
+        // default), but the layers are listed once and each layer's own entries are applied in order, not
+        // four map searches and two allocations per key.
+        let mut values = defaults().clone();
+        let layers = self.layers(faction, bot);
+        for layer in layers {
+            for (k, v) in layer {
+                if let Some(&i) = index().get(k.as_str()) {
+                    values[i] = all()[i].coerce(v);
+                }
+            }
+        }
         Snapshot {
-            values,
+            values: std::sync::Arc::new(values),
             generation: self.generation,
         }
     }
@@ -636,7 +674,9 @@ impl Settings {
 /// One bot's resolved settings.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
-    values: Vec<Value>,
+    /// Shared: a snapshot is cloned by the brain many times a tick (`let st = bot.settings.clone()`), which
+    /// must cost a counter bump, not a copy of 230 values. `set` copies on write.
+    values: std::sync::Arc<Vec<Value>>,
     pub generation: u64,
 }
 
@@ -700,7 +740,7 @@ impl Snapshot {
     /// Overrides one value in this snapshot only (a bot's skill spread inside its faction).
     pub fn set(&mut self, key: &str, v: Value) {
         if let (Some(&i), Some(spec)) = (index().get(key), spec(key)) {
-            self.values[i] = spec.coerce(&v);
+            std::sync::Arc::make_mut(&mut self.values)[i] = spec.coerce(&v);
         }
     }
 

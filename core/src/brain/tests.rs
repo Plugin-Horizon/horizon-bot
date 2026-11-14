@@ -729,3 +729,384 @@ fn bench_300_bots_decision_logic() {
     bench_run(80, 850, true, true);
     bench_run(300, 900, true, true);
 }
+
+/// A world that counts its block reads (the glue's cost is mostly per read).
+struct Counting<'a> {
+    inner: &'a MapWorld,
+    reads: std::cell::Cell<u64>,
+}
+
+impl crate::world::BlockView for Counting<'_> {
+    fn block(&self, x: i32, y: i32, z: i32) -> crate::world::Block {
+        self.reads.set(self.reads.get() + 1);
+        self.inner.block(x, y, z)
+    }
+}
+
+/// Terrain benchmark (ignored by default; `cargo test --release bench_terrain -- --ignored --nocapture`):
+/// `bots` bots in two hostile factions on a 120x120 field crossed by walls with gaps, so chasing
+/// needs paths. Prints the time and the block reads per server tick (mean and worst tick).
+pub fn bench_terrain_run(bots: usize, ticks: u64) -> (f64, f64, u64, u64) {
+    use std::time::Instant;
+    let mut map = MapWorld::flat(63);
+    // Walls every 12 blocks along x and z, 3 high, with a 2-wide gap every 20 blocks.
+    for a in (6..120).step_by(12) {
+        for b in 0..120 {
+            if b % 20 < 2 {
+                continue;
+            }
+            for y in 64..67 {
+                map.set(a, y, b, "minecraft:stone");
+                map.set(b, y, a + 3, "minecraft:stone");
+            }
+        }
+    }
+    let w = Counting { inner: &map, reads: std::cell::Cell::new(0) };
+    let mut rng = 777u64;
+    let mut next = move || {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((rng >> 33) as f64) / ((1u64 << 31) as f64)
+    };
+    let mut squad = Squad::default();
+    for f in ["red", "blue"] {
+        squad.factions.create(f).unwrap();
+    }
+    squad.factions.hostile("red", "blue").unwrap();
+    let mut brains: Vec<Bot> = Vec::new();
+    let mut seen: Vec<Seen> = Vec::new();
+    for i in 0..bots {
+        let f = ["red", "blue"][i % 2];
+        // Red starts west, blue east: they have to find each other through the walls.
+        let x = if i % 2 == 0 { 2.0 + next() * 30.0 } else { 88.0 + next() * 30.0 };
+        let pos = Vec3::new(x.floor() + 0.5, 64.0, (next() * 118.0).floor() + 1.5);
+        let mut b = Bot::new(
+            &format!("Bot{i}"),
+            10_000 + i as u128,
+            pos,
+            0.0,
+            settings_with(&[("ping-millis", "0"), ("reaction-ticks", "0"), ("spawn-grace", "0"), ("max-target-distance", "128")]),
+            0,
+        );
+        b.faction = Some(f.to_owned());
+        squad.factions.join(f, &format!("Bot{i}")).unwrap();
+        settle(&mut b, &map);
+        let mut s = player(i as i32, &format!("Bot{i}"), b.body.pos);
+        s.uuid = b.uuid;
+        s.is_bot = true;
+        s.faction = Some(f.to_owned());
+        s.held = Some("minecraft:diamond_sword".into());
+        brains.push(b);
+        seen.push(s);
+    }
+    let me = me_with(&[(0, "diamond_sword", 1)]);
+    let mut idx: Vec<u32> = Vec::new();
+    let (mut total, mut worst, mut reads_total, mut reads_worst) = (0.0f64, 0.0f64, 0u64, 0u64);
+    for t in 0..ticks {
+        squad.begin_tick(t);
+        let c = Instant::now();
+        w.reads.set(0);
+        for i in 0..bots {
+            idx.clear();
+            idx.extend((0..seen.len() as u32).filter(|&j| j as usize != i));
+            let p = Perception { others: Others::indexed(&seen, &idx), ..perceive(t, &me, &[], &map) };
+            let p = Perception { world: &w, ..p };
+            let d = brains[i].tick(&p, &mut squad);
+            std::hint::black_box(&d);
+        }
+        for (i, b) in brains.iter().enumerate() {
+            seen[i].pos = b.body.pos;
+            seen[i].vel = b.body.vel;
+        }
+        let ms = c.elapsed().as_secs_f64() * 1000.0;
+        total += ms;
+        worst = worst.max(ms);
+        reads_total += w.reads.get();
+        reads_worst = reads_worst.max(w.reads.get());
+    }
+    let mean = total / ticks as f64;
+    println!(
+        "bench_terrain: {bots} bots, {ticks} ticks: {mean:.2} ms/tick (worst {worst:.2}), block reads {}/tick (worst {reads_worst})",
+        reads_total / ticks
+    );
+    (mean, worst, reads_total / ticks, reads_worst)
+}
+
+#[test]
+#[ignore]
+fn bench_terrain() {
+    bench_terrain_run(40, 200);
+    bench_terrain_run(120, 200);
+}
+
+fn wall_world() -> MapWorld {
+    let mut map = MapWorld::flat(63);
+    for x in -40..=60 {
+        for y in 64..=66 {
+            map.set(x, y, 3, "minecraft:stone");
+        }
+    }
+    map
+}
+
+#[test]
+fn chasing_a_moving_target_behind_a_wall_searches_rarely() {
+    let map = wall_world();
+    let me = me_with(&[]);
+    let mut bot = bot_at(Vec3::new(0.5, 64.0, 0.5));
+    settle(&mut bot, &map);
+    let mut searches = 0;
+    let mut last = bot.last_search;
+    for t in 1..=80u64 {
+        // The target runs along the far side of the wall.
+        let goal = Vec3::new(10.5 + t as f64 * 0.5, 64.0, 6.5);
+        let p = perceive(t, &me, &[], &map);
+        let mut d = Decision::default();
+        bot.walk_to(&p, &mut d, goal, true);
+        if bot.last_search != last {
+            searches += 1;
+            last = bot.last_search;
+        }
+    }
+    assert!(searches >= 1, "it must search at all");
+    assert!(searches <= 80 / NAV_SPACING as usize + 1, "{searches} searches in 80 ticks");
+}
+
+#[test]
+fn an_empty_shared_budget_means_no_search() {
+    let map = wall_world();
+    let me = me_with(&[]);
+    let mut bot = bot_at(Vec3::new(0.5, 64.0, 0.5));
+    settle(&mut bot, &map);
+    bot.nav_left = 0;
+    let p = perceive(5, &me, &[], &map);
+    let mut d = Decision::default();
+    bot.walk_to(&p, &mut d, Vec3::new(0.5, 64.0, 8.5), true);
+    assert_eq!(bot.last_search, 0);
+    assert!(bot.path.is_empty());
+    assert_eq!(bot.nav_used, 0);
+    // With budget it searches, pays for it, and finds a way round.
+    bot.nav_left = 3000;
+    bot.walk_to(&p, &mut d, Vec3::new(0.5, 64.0, 8.5), true);
+    assert!(bot.nav_used > 0 && bot.nav_used <= 3000 && !bot.path.is_empty());
+}
+
+#[test]
+fn a_bot_starved_of_the_shared_budget_searches_small_after_a_while() {
+    let map = wall_world();
+    let me = me_with(&[]);
+    let mut bot = bot_at(Vec3::new(0.5, 64.0, 0.5));
+    settle(&mut bot, &map);
+    let goal = Vec3::new(0.5, 64.0, 8.5);
+    let mut d = Decision::default();
+    for t in 5..5 + NAV_STARVED_TICKS {
+        bot.nav_left = 0;
+        bot.walk_to(&perceive(t, &me, &[], &map), &mut d, goal, true);
+        assert_eq!(bot.last_search, 0, "searched at {t} without budget");
+    }
+    bot.nav_left = 0;
+    bot.walk_to(&perceive(5 + NAV_STARVED_TICKS, &me, &[], &map), &mut d, goal, true);
+    assert_eq!(bot.last_search, 5 + NAV_STARVED_TICKS, "still starved");
+    assert!(bot.nav_used > 0 && bot.nav_used <= NAV_STARVED_BUDGET + 1, "used {}", bot.nav_used);
+    assert_eq!(bot.nav_waiting_since, 0);
+}
+
+#[test]
+fn the_squad_budget_is_charged_and_capped_per_tick() {
+    let map = wall_world();
+    let me = me_with(&[]);
+    let mut squad = Squad::default();
+    squad.begin_tick(1);
+    squad.nav_spent = squad::NAV_BUDGET_PER_TICK;
+    let mut bot = bot_at(Vec3::new(0.5, 64.0, 0.5));
+    settle(&mut bot, &map);
+    let p = perceive(1, &me, &[], &map);
+    bot.tick(&p, &mut squad);
+    assert_eq!(bot.nav_left, 0);
+    assert_eq!(squad.nav_spent, squad::NAV_BUDGET_PER_TICK);
+    squad.begin_tick(2);
+    assert_eq!(squad.nav_spent, 0);
+}
+
+#[test]
+fn swapping_the_weapon_restarts_the_swing_meter() {
+    let w = MapWorld::flat(63);
+    let mut bot = bot_with(
+        Vec3::new(0.5, 64.0, 0.5),
+        &[("ping-millis", "0"), ("reaction-ticks", "0"), ("spawn-grace", "0"), ("miss-chance", "0"), ("mistake-chance", "0"), ("shield-disable-chance", "100")],
+    );
+    settle(&mut bot, &w);
+    let me = me_with(&[(0, "diamond_sword", 1), (1, "diamond_axe", 1)]);
+    let mut steve = player(9, "Steve", Vec3::new(0.5, 64.0, 2.5));
+    steve.blocking = true;
+    let others = [steve];
+    bot.orders.attack = Some("Steve".into());
+    bot.fight.since_swing = 100;
+    let mut squad = Squad::default();
+    let (mut swapped, mut attacked) = (None, None);
+    for t in 0..60 {
+        squad.begin_tick(t);
+        let d = bot.tick(&perceive(t, &me, &others, &w), &mut squad);
+        if swapped.is_none() && d.actions.contains(&Action::SelectSlot(1)) {
+            swapped = Some(t);
+        }
+        if attacked.is_none() && d.actions.contains(&Action::Attack(9)) {
+            attacked = Some(t);
+        }
+    }
+    let (s, a) = (swapped.expect("axe taken out"), attacked.expect("attacked with the axe"));
+    // The axe takes 20 ticks to recharge: never a hit at 5% charge right after the swap.
+    assert!(a - s >= 17, "swapped at {s}, hit at {a}");
+}
+
+#[test]
+fn the_crit_swing_is_not_sprinting() {
+    let w = MapWorld::flat(63);
+    let mut bot = bot_with(Vec3::new(0.5, 64.8, 0.5), &[("ping-millis", "0"), ("reaction-ticks", "0"), ("spawn-grace", "0"), ("miss-chance", "0")]);
+    bot.body.on_ground = false;
+    bot.body.vel = Vec3::new(0.0, -0.3, 0.0);
+    bot.body.fall_distance = 0.8;
+    bot.fight.target = Some(5);
+    bot.fight.landed_streak = 2;
+    bot.fight.opened = true;
+    bot.fight.since_swing = 100;
+    let me = me_with(&[(0, "diamond_sword", 1)]);
+    let others = [zombie(5, Vec3::new(0.5, 64.0, 2.5))];
+    let mut squad = Squad::default();
+    let d = bot.tick(&perceive(1, &me, &others, &w), &mut squad);
+    assert!(d.actions.contains(&Action::Attack(5)), "{:?}", d.actions);
+    assert!(!d.input.sprint, "swung a crit while sprinting");
+}
+
+#[test]
+fn a_hostile_mob_at_arms_length_beats_a_far_player() {
+    let w = MapWorld::flat(63);
+    let me = me_with(&[(0, "diamond_sword", 1)]);
+    let pick = |zombie_z: f64| {
+        let mut bot = bot_with(Vec3::new(0.5, 64.0, 0.5), &[("ping-millis", "0"), ("reaction-ticks", "0"), ("spawn-grace", "0"), ("target-players", "true")]);
+        settle(&mut bot, &w);
+        let others = [zombie(5, Vec3::new(0.5, 64.0, 0.5 + zombie_z)), player(9, "Steve", Vec3::new(0.5, 64.0, 20.5))];
+        let mut squad = Squad::default();
+        squad.begin_tick(1);
+        combat::choose_target(&mut bot, &perceive(1, &me, &others, &w), &mut squad).map(|s| s.id)
+    };
+    assert_eq!(pick(2.0), Some(5));
+    assert_eq!(pick(10.0), Some(9));
+}
+
+#[test]
+fn a_hurt_bot_with_nothing_to_recover_with_fights_on() {
+    let w = MapWorld::flat(63);
+    let opts = [("ping-millis", "0"), ("reaction-ticks", "0"), ("spawn-grace", "0"), ("mistake-chance", "0"), ("auto-potion", "false")];
+    let mut steve = player(9, "Steve", Vec3::new(0.5, 64.0, 2.5));
+    steve.health = 4.0;
+    let others = [steve];
+    let modes_with = |items: &[(usize, &str, u32)]| {
+        let mut bot = bot_with(Vec3::new(0.5, 64.0, 0.5), &opts);
+        settle(&mut bot, &w);
+        let mut me = me_with(items);
+        me.health = 5.0;
+        bot.orders.attack = Some("Steve".into());
+        run(&mut bot, &me, &others, &w, 3).1
+    };
+    let bare = modes_with(&[(0, "iron_sword", 1)]);
+    assert!(!bare.contains(&"retreat") && bare.contains(&"fight"), "{bare:?}");
+    let pearl = modes_with(&[(0, "iron_sword", 1), (2, "ender_pearl", 16)]);
+    assert!(pearl.contains(&"retreat"), "{pearl:?}");
+}
+
+#[test]
+fn a_comboer_sprint_hits_when_charged() {
+    let w = MapWorld::flat(63);
+    let me = me_with(&[(0, "diamond_sword", 1)]);
+    let others = [zombie(5, Vec3::new(0.5, 64.0, 2.5))];
+    let first = |comboer: bool| {
+        let mut bot = bot_with(Vec3::new(0.5, 64.0, 0.5), &[("ping-millis", "0"), ("reaction-ticks", "0"), ("spawn-grace", "0"), ("miss-chance", "0")]);
+        settle(&mut bot, &w);
+        bot.personality.comboer = comboer;
+        bot.fight.since_swing = 100;
+        bot.tick(&perceive(1, &me, &others, &w), &mut Squad::default())
+    };
+    let d = first(true);
+    assert!(d.actions.contains(&Action::Attack(5)) && d.input.sprint, "{:?} sprint {}", d.actions, d.input.sprint);
+    // The jump-crit path never sprints.
+    let d = first(false);
+    assert!(!d.input.sprint, "hop with sprint");
+}
+
+#[test]
+fn the_sight_cache_is_reused_then_dropped_when_eyes_move_or_it_gets_old() {
+    let w = MapWorld::flat(63);
+    let counting = Counting { inner: &w, reads: std::cell::Cell::new(0) };
+    let bot = bot_with(Vec3::new(0.5, 64.0, 0.5), &[]);
+    let me = me_with(&[]);
+    let mut other = player(7, "Alex", Vec3::new(8.5, 64.0, 0.5));
+    let p = |t| Perception { world: &counting, ..perceive(t, &me, &[], &w) };
+    assert!(combat::sees(&bot, &p(10), &other));
+    let first = counting.reads.get();
+    assert!(first > 0);
+    assert!(combat::sees(&bot, &p(12), &other));
+    assert_eq!(counting.reads.get(), first, "reused within 4 ticks");
+    other.pos.x += 2.0;
+    assert!(combat::sees(&bot, &p(12), &other));
+    assert!(counting.reads.get() > first, "other moved: looked up again");
+    let second = counting.reads.get();
+    assert!(combat::sees(&bot, &p(20), &other));
+    assert!(counting.reads.get() > second, "too old: looked up again");
+}
+
+#[test]
+fn switching_items_outside_melee_restarts_the_swing_meter() {
+    let w = MapWorld::flat(63);
+    let mut bot = bot_at(Vec3::new(0.5, 64.0, 0.5));
+    settle(&mut bot, &w);
+    let mut me = me_with(&[(0, "diamond_sword", 1), (1, "cooked_beef", 8)]);
+    let mut squad = Squad::default();
+    bot.tick(&perceive(1, &me, &[], &w), &mut squad);
+    bot.fight.since_swing = 100;
+    bot.tick(&perceive(2, &me, &[], &w), &mut squad);
+    assert!(bot.fight.since_swing > 100, "same item: no restart");
+    me.inventory.selected = 1;
+    bot.tick(&perceive(3, &me, &[], &w), &mut squad);
+    assert!(bot.fight.since_swing <= 1, "food in hand: restarted ({})", bot.fight.since_swing);
+    bot.fight.since_swing = 100;
+    me.inventory.selected = 0;
+    bot.tick(&perceive(4, &me, &[], &w), &mut squad);
+    assert!(bot.fight.since_swing <= 1, "back to the sword: restarted ({})", bot.fight.since_swing);
+}
+
+#[test]
+fn only_the_nearest_candidates_get_a_sight_check() {
+    let map = MapWorld::flat(63);
+    let w = Counting { inner: &map, reads: std::cell::Cell::new(0) };
+    let me = me_with(&[(0, "diamond_sword", 1)]);
+    let mut squad = Squad::default();
+    squad.begin_tick(1);
+    // Forty players in front, none known yet: each needs the line of sight to be noticed.
+    let others: Vec<Seen> = (0..40).map(|i| player(i, &format!("P{i}"), Vec3::new(0.5 + (i % 5) as f64, 64.0, 6.5 + i as f64 * 0.5))).collect();
+    let mut bot = bot_at(Vec3::new(0.5, 64.0, 0.5));
+    let p = Perception { world: &w, ..perceive(1, &me, &others, &map) };
+    let t = combat::choose_target(&mut bot, &p, &mut squad).expect("a target");
+    assert_eq!(t.id, 0, "the nearest one");
+    assert!(bot.sight_cache.borrow().len() <= combat::TARGET_CANDIDATES, "{} sight checks", bot.sight_cache.borrow().len());
+}
+
+#[test]
+fn a_war_enemy_beyond_five_nearer_strangers_is_still_chosen() {
+    let map = MapWorld::flat(63);
+    let me = me_with(&[(0, "diamond_sword", 1)]);
+    let mut squad = Squad::default();
+    for f in ["red", "blue"] {
+        squad.factions.create(f).unwrap();
+    }
+    squad.factions.hostile("red", "blue").unwrap();
+    squad.begin_tick(1);
+    let mut others: Vec<Seen> = (0..8).map(|i| player(i, &format!("P{i}"), Vec3::new(0.5, 64.0, 3.5 + i as f64))).collect();
+    let mut foe = player(50, "Foe", Vec3::new(0.5, 64.0, 20.5));
+    foe.faction = Some("blue".into());
+    others.push(foe);
+    // (No reaction ripple: it would hold the pick back for a few ticks.)
+    let mut bot = bot_with(Vec3::new(0.5, 64.0, 0.5), &[("ping-millis", "0"), ("reaction-ticks", "0"), ("spawn-grace", "0"), ("reaction-ripple", "false")]);
+    bot.faction = Some("red".into());
+    let t = combat::choose_target(&mut bot, &perceive(1, &me, &others, &map), &mut squad).expect("a target");
+    assert_eq!(t.id, 50, "war comes before distance");
+}

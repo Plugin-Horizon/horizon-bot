@@ -13,7 +13,7 @@ nothing yet. Every line is untested on a server.
 | Spawn (one, named, count up to max-bots, name tables, skin from an account, `none`) | written | offline UUIDs as on Paper |
 | A bot is a real player (inventory, hunger, effects, vanilla damage and knockback) | written | virtual connection, GAPS.md |
 | No join message | not started | GAPS.md: quiet join |
-| Appears where spawned | partly | teleported after placement (a hop from spawn) |
+| Appears where spawned | yes (engine API `native_expect_fake_player_at`) | the hub places it at the spawn position when it joins; the teleport after placement is only a fallback |
 | Skins: own name, `skinFrom`, random pool (missing/always/off), no repeats in a round, `skin-cache.yml`, SkinsRestorer cooperation | partly | Mojang lookups from the mod; nothing to cooperate with on Horizon |
 | `remove`, `removeall`, `list`, `reload` | written | |
 | `restock [instant]` | written | the ender-chest show is the brain's regear; `restock` without `instant` backs off, then fills |
@@ -61,7 +61,7 @@ nothing yet. Every line is untested on a server.
 |---|---|---|
 | Client physics (walk, sprint, jump with sprint boost, gravity, drag, friction, step-up, water, lava, cobwebs, ladders, sneaking at edges, slow falling, levitation, speed, jump boost) | written | tested against vanilla's numbers; coarse block shapes (GAPS.md) |
 | Elytra flight and rockets | partly | condensed glide maths |
-| A* pathfinding (walk, step, drop up to 3, climb, swim), smoothing, straight line when clear | written | |
+| A* pathfinding (walk, step, drop up to 3, climb, swim), smoothing, straight line when clear | written | searches spaced per bot (10 ticks + jitter) and capped across all bots per tick (`NAV_BUDGET_PER_TICK`); a bot that waited 20 ticks searches small anyway |
 | Building: bridge, pillar (max), dig soft cover only, cooldown, budget a minute, `extra-breakable` | written | |
 | Bunny hops on straight stretches, own rhythm; wander; idle fidgets | written | |
 | Boats | not started | |

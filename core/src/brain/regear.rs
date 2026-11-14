@@ -27,7 +27,7 @@ pub fn regear(bot: &mut Bot, p: &Perception, d: &mut Decision, threat: Option<&S
     let tick = p.tick;
     let inv = &p.me.inventory;
     let skill = st.knob("technique");
-    let away = threat.is_none_or(|t| t.pos.distance(bot.body.pos) > st.f("regear-distance") || !p.world.line_of_sight(bot.body.eye(), t.eye()));
+    let away = threat.is_none_or(|t| t.pos.distance(bot.body.pos) > st.f("regear-distance") || !super::combat::sees(bot, p, t));
     match bot.regear.clone() {
         Regear::Idle => {
             let ender = st.b("enderchest-regear") && inv.has("ender_chest");

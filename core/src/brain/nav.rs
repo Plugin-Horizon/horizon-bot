@@ -5,6 +5,28 @@
 use crate::math::{yaw_to, Vec3};
 use crate::world::{BlockView, Fluid};
 use std::collections::{BinaryHeap, HashMap};
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// A fast non-cryptographic hasher (FxHash-style) for the search's position keys.
+#[derive(Default, Clone, Copy)]
+pub struct FxHasher(u64);
+impl Hasher for FxHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(b as u64);
+        }
+    }
+    fn write_i32(&mut self, i: i32) {
+        self.write_u64(i as u32 as u64);
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 pub type Pos = [i32; 3];
 
@@ -47,7 +69,14 @@ fn dist(a: Pos, b: Pos) -> f64 {
     (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
 }
 
-fn neighbours(w: &dyn BlockView, p: Pos, out: &mut Vec<(Pos, f64)>) {
+/// Per-search memo of `standable`: each cell is asked about by up to eight neighbours.
+type Memo = FxMap<Pos, bool>;
+
+fn stand(w: &dyn BlockView, memo: &mut Memo, p: Pos) -> bool {
+    *memo.entry(p).or_insert_with(|| standable(w, p))
+}
+
+fn neighbours(w: &dyn BlockView, memo: &mut Memo, p: Pos, out: &mut Vec<(Pos, f64)>) {
     out.clear();
     let [x, y, z] = p;
     let here = w.block(x, y, z);
@@ -65,14 +94,14 @@ fn neighbours(w: &dyn BlockView, p: Pos, out: &mut Vec<(Pos, f64)>) {
         }
         let base = if diag { std::f64::consts::SQRT_2 } else { 1.0 };
         let flat = [x + dx, y, z + dz];
-        if standable(w, flat) {
+        if stand(w, memo, flat) {
             let water = w.block(flat[0], flat[1], flat[2]).fluid == Fluid::Water;
             out.push((flat, base + if water { 2.0 } else { 0.0 }));
             continue;
         }
         // Step or jump up one (head room above us too).
         let up = [x + dx, y + 1, z + dz];
-        if !diag && w.block(x, y + 2, z).passable() && standable(w, up) {
+        if !diag && w.block(x, y + 2, z).passable() && stand(w, memo, up) {
             out.push((up, base + 0.6));
             continue;
         }
@@ -82,7 +111,7 @@ fn neighbours(w: &dyn BlockView, p: Pos, out: &mut Vec<(Pos, f64)>) {
             if !w.block(x + dx, y - d + 1, z + dz).passable() {
                 break;
             }
-            if standable(w, down) {
+            if stand(w, memo, down) {
                 out.push((down, base + 0.3 * d as f64));
                 break;
             }
@@ -91,13 +120,13 @@ fn neighbours(w: &dyn BlockView, p: Pos, out: &mut Vec<(Pos, f64)>) {
     // Ladders and water: straight up and down.
     if here.climbable || here.fluid == Fluid::Water {
         let up = [x, y + 1, z];
-        if standable(w, up) || w.block(x, y + 1, z).climbable {
+        if stand(w, memo, up) || w.block(x, y + 1, z).climbable {
             out.push((up, 1.2));
         }
     }
     let down = [x, y - 1, z];
     let below = w.block(x, y - 1, z);
-    if (below.climbable || below.fluid == Fluid::Water) && standable(w, down) {
+    if (below.climbable || below.fluid == Fluid::Water) && stand(w, memo, down) {
         out.push((down, 1.0));
     }
 }
@@ -105,21 +134,32 @@ fn neighbours(w: &dyn BlockView, p: Pos, out: &mut Vec<(Pos, f64)>) {
 /// A route from `start` to within `reach` blocks of `goal` (feet positions), at most `budget`
 /// nodes searched. Long detours are found: the heuristic is weighted only slightly.
 pub fn find_path(w: &dyn BlockView, start: Pos, goal: Pos, reach: f64, budget: usize) -> Option<Vec<Pos>> {
+    find_path_counted(w, start, goal, reach, budget).0
+}
+
+/// `find_path`, also returning how many nodes were expanded (what the shared search budget pays for).
+pub fn find_path_counted(w: &dyn BlockView, start: Pos, goal: Pos, reach: f64, budget: usize) -> (Option<Vec<Pos>>, usize) {
     if dist(start, goal) > 160.0 {
-        return None;
+        return (None, 0);
     }
     let mut open = BinaryHeap::new();
-    let mut g: HashMap<Pos, f64> = HashMap::new();
-    let mut from: HashMap<Pos, Pos> = HashMap::new();
+    let mut g: FxMap<Pos, f64> = FxMap::default();
+    let mut from: FxMap<Pos, Pos> = FxMap::default();
+    let mut memo = Memo::default();
     g.insert(start, 0.0);
     open.push(Node { f: dist(start, goal), p: start });
     let mut nbrs = Vec::new();
     let mut best = (dist(start, goal), start);
     let mut searched = 0;
-    while let Some(Node { p, .. }) = open.pop() {
+    while let Some(Node { p, f }) = open.pop() {
+        let gp = g[&p];
+        // An entry superseded by a cheaper route to the same cell: that one was expanded already.
+        if p != start && f > gp + dist(p, goal) * 1.1 + 1e-6 {
+            continue;
+        }
         let d = dist(p, goal);
         if d <= reach {
-            return Some(rebuild(&from, p));
+            return (Some(rebuild(&from, p)), searched);
         }
         if d < best.0 {
             best = (d, p);
@@ -128,8 +168,7 @@ pub fn find_path(w: &dyn BlockView, start: Pos, goal: Pos, reach: f64, budget: u
         if searched > budget {
             break;
         }
-        let gp = g[&p];
-        neighbours(w, p, &mut nbrs);
+        neighbours(w, &mut memo, p, &mut nbrs);
         for &(n, c) in &nbrs {
             let ng = gp + c;
             if g.get(&n).is_none_or(|&old| ng < old - 1e-9) {
@@ -140,10 +179,11 @@ pub fn find_path(w: &dyn BlockView, start: Pos, goal: Pos, reach: f64, budget: u
         }
     }
     // Out of budget or no way: the route to the closest point reached, if it gets closer.
-    (best.1 != start && best.0 + 1.0 < dist(start, goal)).then(|| rebuild(&from, best.1))
+    let route = (best.1 != start && best.0 + 1.0 < dist(start, goal)).then(|| rebuild(&from, best.1));
+    (route, searched)
 }
 
-fn rebuild(from: &HashMap<Pos, Pos>, mut p: Pos) -> Vec<Pos> {
+fn rebuild(from: &FxMap<Pos, Pos>, mut p: Pos) -> Vec<Pos> {
     let mut v = vec![p];
     while let Some(&q) = from.get(&p) {
         v.push(q);
@@ -153,20 +193,42 @@ fn rebuild(from: &HashMap<Pos, Pos>, mut p: Pos) -> Vec<Pos> {
     v
 }
 
+const SMOOTH_LOOKAHEAD: usize = 16;
+
 /// Drops the points a straight walk would pass anyway (same height, clear line of floor).
 pub fn smooth(w: &dyn BlockView, path: &[Pos]) -> Vec<Pos> {
     if path.len() <= 2 {
         return path.to_vec();
     }
+    // From each anchor the farthest point (within the look-ahead) a straight walk reaches: the far end is tried
+    // first and, if it fails, a bisection finds the last good one. (Trying every point from the anchor up, each
+    // a straight-walk check of growing length, cost several times the search itself on an open field.) The next
+    // point after the anchor is always taken, as a walk of one step needs no check.
+    let last = path.len() - 1;
     let mut out = vec![path[0]];
     let mut anchor = 0;
-    for i in 2..path.len() {
-        if !straight_walkable(w, path[anchor], path[i]) {
-            out.push(path[i - 1]);
-            anchor = i - 1;
+    while anchor < last {
+        let far = (anchor + SMOOTH_LOOKAHEAD).min(last);
+        let mut best = anchor + 1;
+        if far > best {
+            if straight_walkable(w, path[anchor], path[far]) {
+                best = far;
+            } else {
+                let (mut lo, mut hi) = (best, far);
+                while hi - lo > 1 {
+                    let mid = (lo + hi) / 2;
+                    if straight_walkable(w, path[anchor], path[mid]) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                best = lo;
+            }
         }
+        out.push(path[best]);
+        anchor = best;
     }
-    out.push(*path.last().unwrap());
     out
 }
 

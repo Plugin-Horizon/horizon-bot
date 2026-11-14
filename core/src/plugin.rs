@@ -166,6 +166,9 @@ pub struct Plugin {
     /// Owner uuid -> next summon allowed.
     summon_ready: BTreeMap<u128, u64>,
     dirty: BTreeSet<&'static str>,
+    /// The tick `bots.yml` was last written: it is rewritten at most every `BOTS_SAVE_GAP` ticks while it is
+    /// marked again and again (each spawn, kit and setting command marks it, and every write dumps every bot).
+    bots_saved_at: Option<u64>,
     /// The operator level `horizonbot.admin` stands for.
     pub admin_level: u8,
     /// Who sees debug lines.
@@ -208,6 +211,7 @@ impl Plugin {
             players: Vec::new(),
             summon_ready: BTreeMap::new(),
             dirty: BTreeSet::new(),
+            bots_saved_at: None,
             admin_level: 2,
             debug_all: false,
             pending_restock: BTreeMap::new(),
@@ -274,6 +278,14 @@ impl Plugin {
         let dirty = std::mem::take(&mut self.dirty);
         let mut out = Vec::new();
         for f in dirty {
+            if f == "bots.yml" {
+                // `begin_tick` calls this every tick, so a deferred write follows; `stopping` writes it anyway.
+                if self.bots_saved_at.is_some_and(|t| self.tick < t + BOTS_SAVE_GAP) {
+                    self.dirty.insert(f);
+                    continue;
+                }
+                self.bots_saved_at = Some(self.tick);
+            }
             let doc = match f {
                 "factions.yml" => self.squad.factions.save(),
                 "kits.yml" => self.kits.save(),
@@ -2172,6 +2184,15 @@ impl Plugin {
         out
     }
 
+    /// The server kicked a bot (another mod's rule, `/kick`): it is gone and `bots-relog` does not
+    /// bring it back. Its name, if it was one of ours.
+    pub fn kicked(&mut self, uuid: u128) -> Option<String> {
+        let key = self.bots.iter().find(|(_, l)| l.bot.uuid == uuid).map(|(k, _)| k.clone())?;
+        let l = self.bots.remove(&key)?;
+        self.mark("bots.yml");
+        Some(l.bot.name)
+    }
+
     /// A chat line from a real player: a companion order is cancelled for everyone and answered.
     pub fn chat(&mut self, uuid: u128, name: &str, message: &str) -> (bool, Vec<String>, Vec<Effect>) {
         let own = self.owned_by(name);
@@ -2546,6 +2567,9 @@ fn stat_line(m: &Messages, r: &crate::stats::Record, prefix: &str) -> String {
         ],
     )
 }
+
+/// Ticks between two writes of `bots.yml` (5 s).
+const BOTS_SAVE_GAP: u64 = 100;
 
 const HELP: &str = "HorizonBot: spawn, remove, removeall, list, menu, view, restock, attack, fight, stop, retreat, hide, tether, follow, guard, pause, resume, tp, path, set, settings, difficulty, playstyle, randomplaystyle, randomplaystylechances, techniques, faction (f), overfaction (of), kit, preset, script, owner, diagnose, arena, debugview, stats, debug, givebow, drop, resetattr, clearplayerdata, reload. /ghost record|stoprecord|spawn|stare|remove|list|recordings.";
 
