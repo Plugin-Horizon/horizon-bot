@@ -1276,10 +1276,10 @@ fn engine_move(game: &mut Game<'_>, b: &BotRef, d: &pc::brain::Decision) -> Opti
     pb::with(|g| {
         if let Some(live) = g.plugin.as_mut().and_then(|p| p.bots.get_mut(&b.key)) {
             let body = &mut live.bot.body;
-            body.pos = pos;
-            body.vel = Vec3::from_array(m.velocity);
-            body.on_ground = m.on_ground;
-            body.horizontal_collision = m.horizontal_collision;
+            // The engine plays this bot's move: from now on the brain's own body skips its collision
+            // move (it was simulated and then thrown away) and takes the engine's result here.
+            body.engine_plays = true;
+            body.apply_engine_result(pos, Vec3::from_array(m.velocity), m.on_ground, m.horizontal_collision);
             body.sprinting = m.sprinting;
         }
     });
