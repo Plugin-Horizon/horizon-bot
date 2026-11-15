@@ -2484,24 +2484,40 @@ impl Plugin {
     /// One bot's turn. None for a bot not placed yet.
     pub fn think(&mut self, name: &str, p: &Perception) -> Option<Decision> {
         let key = name.to_ascii_lowercase();
-        let l = self.bots.get_mut(&key)?;
+        self.think_key(&key, name, p).map(|t| t.0)
+    }
+
+    /// `think` for a bot whose key (its name in lower case) is at hand: the decision, then where the
+    /// bot's body is (position, on the ground, against a wall) for the engine's turn, from one lookup.
+    pub fn think_key(&mut self, key: &str, name: &str, p: &Perception) -> Option<(Decision, Vec3, bool, bool)> {
+        let l = self.bots.get_mut(key)?;
         if !l.joined {
             return None;
         }
-        if l.bot.settings.generation != self.settings.generation {
-            let f = self.squad.factions.faction_of(name).map(str::to_owned);
-            let snap = self.snapshot_for(name);
-            let l = self.bots.get_mut(&key)?;
-            l.bot.settings = snap;
-            l.bot.faction = f;
+        if l.bot.settings.generation == self.settings.generation {
+            let d = l.bot.tick(p, &mut self.squad);
+            let b = &l.bot.body;
+            return Some((d, b.pos, b.on_ground, b.horizontal_collision));
         }
-        let l = self.bots.get_mut(&key)?;
-        Some(l.bot.tick(p, &mut self.squad))
+        let f = self.squad.factions.faction_of(name).map(str::to_owned);
+        let snap = self.snapshot_for(name);
+        let l = self.bots.get_mut(key)?;
+        l.bot.settings = snap;
+        l.bot.faction = f;
+        let d = l.bot.tick(p, &mut self.squad);
+        let b = &l.bot.body;
+        Some((d, b.pos, b.on_ground, b.horizontal_collision))
     }
 
     /// The level a bot is in now (portals and teleports move it).
     pub fn bot_world(&mut self, name: &str, dimension: &str) {
-        if let Some(l) = self.bot_mut(name) {
+        let key = name.to_ascii_lowercase();
+        self.bot_world_key(&key, dimension);
+    }
+
+    /// `bot_world` for a bot whose key (its name in lower case) is at hand.
+    pub fn bot_world_key(&mut self, key: &str, dimension: &str) {
+        if let Some(l) = self.bots.get_mut(key) {
             if l.world != dimension {
                 l.world = dimension.to_owned();
             }

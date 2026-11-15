@@ -26,8 +26,9 @@ impl Stack {
         self.id.strip_prefix("minecraft:").unwrap_or(&self.id)
     }
     pub fn enchant(&self, id: &str) -> u32 {
-        let id = full(id);
-        self.enchants.iter().find(|(e, _)| *e == id).map_or(0, |(_, l)| *l)
+        // No allocation: this runs for every weapon of every bot every tick.
+        let id = short(id);
+        self.enchants.iter().find(|(e, _)| short(e) == id).map_or(0, |(_, l)| *l)
     }
     pub fn with_enchant(mut self, id: &str, level: u32) -> Self {
         self.enchants.push((full(id), level));

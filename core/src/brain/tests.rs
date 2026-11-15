@@ -8,6 +8,8 @@ use crate::world::MapWorld;
 
 pub fn settings_with(pairs: &[(&str, &str)]) -> Snapshot {
     let mut s = Settings::new();
+    // Tests look for a target every tick unless they ask for the idle beat.
+    s.set_global("idle-scan-interval", "1").unwrap();
     for (k, v) in pairs {
         s.set_global(k, v).unwrap();
     }
@@ -1109,4 +1111,78 @@ fn a_war_enemy_beyond_five_nearer_strangers_is_still_chosen() {
     bot.faction = Some("red".into());
     let t = combat::choose_target(&mut bot, &perceive(1, &me, &others, &map), &mut squad).expect("a target");
     assert_eq!(t.id, 50, "war comes before distance");
+}
+
+#[test]
+fn no_crit_hop_in_front_of_a_raised_shield_without_an_axe() {
+    let w = MapWorld::flat(63);
+    let mut bot = bot_with(
+        Vec3::new(0.5, 64.0, 0.5),
+        &[("ping-millis", "0"), ("reaction-ticks", "0"), ("spawn-grace", "0"), ("crits", "true"), ("hit-select", "true"), ("shield-disable", "false")],
+    );
+    settle(&mut bot, &w);
+    bot.personality.comboer = false;
+    let me = me_with(&[(0, "diamond_sword", 1)]);
+    let mut pl = player(9, "Steve", Vec3::new(0.5, 64.0, 2.5));
+    pl.blocking = true;
+    pl.offhand = Some("minecraft:shield".into());
+    let others = [pl];
+    bot.orders.attack = Some("Steve".into());
+    bot.fight.opened = true;
+    bot.fight.since_swing = 100;
+    let mut squad = Squad::default();
+    for t in 0..40 {
+        squad.begin_tick(t);
+        let d = bot.tick(&perceive(t, &me, &others, &w), &mut squad);
+        if bot.body.on_ground && d.mode == "fight" {
+            assert!(!d.input.jump, "hopped at tick {t}");
+        }
+        assert!(!d.actions.contains(&Action::Attack(9)), "swung into the shield at tick {t}");
+    }
+}
+
+#[test]
+fn a_charged_hit_in_the_ring_keeps_sprinting() {
+    let w = MapWorld::flat(63);
+    let mut bot = bot_with(
+        Vec3::new(0.5, 64.0, 0.5),
+        &[("ping-millis", "0"), ("reaction-ticks", "0"), ("spawn-grace", "0"), ("miss-chance", "0"), ("crits", "false"), ("d-tap", "false"), ("sprint-hits", "true")],
+    );
+    settle(&mut bot, &w);
+    bot.fight.target = Some(5);
+    bot.fight.opened = true;
+    bot.fight.since_swing = 100;
+    let me = me_with(&[(0, "diamond_sword", 1)]);
+    let others = [zombie(5, Vec3::new(0.5, 64.0, 2.5))];
+    let mut squad = Squad::default();
+    let mut checked = false;
+    for t in 0..30 {
+        squad.begin_tick(t);
+        let d = bot.tick(&perceive(t, &me, &others, &w), &mut squad);
+        if d.actions.contains(&Action::Attack(5)) {
+            assert!(d.input.sprint, "the swing tick drops the sprint (tick {t})");
+            checked = true;
+            break;
+        }
+    }
+    assert!(checked, "never attacked");
+}
+
+#[test]
+fn an_idle_bot_scans_only_on_its_own_beat() {
+    let w = MapWorld::flat(63);
+    let mut bot = bot_with(Vec3::new(0.5, 64.0, 0.5), &[("ping-millis", "0"), ("reaction-ticks", "0"), ("spawn-grace", "0"), ("idle-scan-interval", "4")]);
+    settle(&mut bot, &w);
+    let me = me_with(&[(0, "diamond_sword", 1)]);
+    let others = [zombie(5, Vec3::new(0.5, 64.0, 6.5))];
+    let mut squad = Squad::default();
+    let mut scans = Vec::new();
+    for t in 100..108u64 {
+        squad.begin_tick(t);
+        if combat::choose_target(&mut bot, &perceive(t, &me, &others, &w), &mut squad).is_some() {
+            scans.push(t);
+        }
+    }
+    assert_eq!(scans.len(), 2, "{scans:?}");
+    assert!(scans.iter().all(|t| (t + bot.uuid as u64) % 4 == 0), "{scans:?}");
 }

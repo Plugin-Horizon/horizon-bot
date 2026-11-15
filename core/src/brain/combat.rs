@@ -5,7 +5,7 @@
 
 use super::formation;
 use super::squad::Squad;
-use super::{Action, Bot, Busy, Decision, Hand, MarchTo, Perception, RetreatTo, Seen};
+use super::{Action, Bot, Busy, Decision, Event, Hand, MarchTo, Perception, RetreatTo, Seen};
 use crate::factions::Relation;
 use crate::items::{self, WeaponKind};
 use crate::math::{look_vector, pitch_to, wrap_degrees, yaw_to, Vec3};
@@ -104,16 +104,21 @@ pub fn sees(bot: &Bot, p: &Perception, s: &Seen) -> bool {
     seen
 }
 
+/// Picks the target for this tick, or none (a copy; `choose_target_ref` borrows from the perception).
+pub fn choose_target(bot: &mut Bot, p: &Perception, squad: &mut Squad) -> Option<Seen> {
+    choose_target_ref(bot, p, squad).cloned()
+}
+
 /// Picks the target for this tick, or none. Orders, faction calls and revenge come first and
 /// need no detection beyond knowing the target is there.
-pub fn choose_target(bot: &mut Bot, p: &Perception, squad: &mut Squad) -> Option<Seen> {
+pub fn choose_target_ref<'a>(bot: &mut Bot, p: &Perception<'a>, squad: &mut Squad) -> Option<&'a Seen> {
     let tick = p.tick;
     if bot.orders.stopped {
         return None;
     }
     // An explicit order.
     if let Some(name) = bot.orders.attack.clone() {
-        if let Some(s) = p.by_name(&name).filter(|s| s.health > 0.0).cloned() {
+        if let Some(s) = p.others.iter().find(|s| s.name.eq_ignore_ascii_case(&name)).filter(|s| s.health > 0.0) {
             bot.known.insert(s.id, tick);
             return Some(s);
         }
@@ -121,29 +126,30 @@ pub fn choose_target(bot: &mut Bot, p: &Perception, squad: &mut Squad) -> Option
     // A tether turned hostile.
     if let Some(t) = &bot.orders.tether {
         if squad.tethers.get(&t.target.to_ascii_lowercase()).is_some_and(|s| s.hostile) {
-            if let Some(s) = p.by_name(&t.target).cloned() {
+            if let Some(s) = p.others.iter().find(|s| s.name.eq_ignore_ascii_case(&t.target)) {
                 return Some(s);
             }
         }
     }
     let my_faction = bot.faction.clone();
-    // Peel: whoever is on a nearly dead ally.
+    // Peel: whoever is on a nearly dead ally (rare: the one copy `peel_target` makes is only used to find it again).
     if let Some(e) = super::team::peel_target(bot, p, squad) {
-        if hittable(bot, &e, squad) {
-            bot.known.insert(e.id, tick);
-            bot.last_call = "peeling".into();
-            return Some(e);
+        if let Some(s) = p.others.iter().find(|s| s.id == e.id) {
+            if hittable(bot, s, squad) {
+                bot.known.insert(s.id, tick);
+                bot.last_call = "peeling".into();
+                return Some(s);
+            }
         }
     }
     // The leader's call to arms.
     // (`called_on` builds a key per look: nothing to look for while no call is active.)
     if let Some(f) = my_faction.as_ref().filter(|_| !squad.factions.calls.is_empty()) {
-        let called: Option<Seen> = p
+        let called: Option<&'a Seen> = p
             .others
             .iter()
             .filter(|s| squad.factions.called_on(f, &s.name) && hittable(bot, s, squad))
-            .min_by(|a, b| dist_cmp(bot, a, b))
-            .cloned();
+            .min_by(|a, b| dist_cmp(bot, a, b));
         if let Some(s) = called {
             bot.known.insert(s.id, tick);
             return Some(s);
@@ -153,7 +159,7 @@ pub fn choose_target(bot: &mut Bot, p: &Perception, squad: &mut Squad) -> Option
     let revenge_on = bot.settings.b("revenge") || bot.orders.owner.is_some();
     if revenge_on {
         if let Some((id, _)) = bot.revenge {
-            if let Some(s) = p.get(id).filter(|s| hittable(bot, s, squad)).cloned() {
+            if let Some(s) = p.others.iter().find(|s| s.id == id).filter(|s| hittable(bot, s, squad)) {
                 if bot.orders.retreat.is_none() {
                     return Some(s);
                 }
@@ -166,6 +172,13 @@ pub fn choose_target(bot: &mut Bot, p: &Perception, squad: &mut Squad) -> Option
     // The target is looked at again every `target-scan-interval` ticks (each bot on its own
     // beat); in between it stays on the one it has, unless that one is gone.
     let fighting = bot.fight.target;
+    // With nothing to fight a bot looks round only every `idle-scan-interval` ticks, on its own beat.
+    if fighting.is_none() {
+        let idle = bot.settings.i("idle-scan-interval").max(1) as u64;
+        if idle > 1 && (tick + bot.uuid as u64) % idle != 0 {
+            return None;
+        }
+    }
     let interval = bot.settings.i("target-scan-interval").max(1) as u64;
     let only = fighting.filter(|_| (tick + bot.uuid as u64) % interval != 0);
     let mut best = best_candidate(bot, p, squad, only);
@@ -197,7 +210,7 @@ pub fn choose_target(bot: &mut Bot, p: &Perception, squad: &mut Squad) -> Option
 pub const TARGET_CANDIDATES: usize = 5;
 
 /// The best target by priority (war, player, mob) and then score, among `only` when it is set.
-fn best_candidate(bot: &mut Bot, p: &Perception, squad: &Squad, only: Option<i32>) -> Option<(i32, f64, Seen)> {
+fn best_candidate<'a>(bot: &mut Bot, p: &Perception<'a>, squad: &Squad, only: Option<i32>) -> Option<(i32, f64, &'a Seen)> {
     let tick = p.tick;
     let my_faction = bot.faction.clone();
     let st = &bot.settings;
@@ -212,7 +225,7 @@ fn best_candidate(bot: &mut Bot, p: &Perception, squad: &Squad, only: Option<i32
     let here = bot.body.pos;
     // First the rules that cost nothing, over everyone: the `TARGET_CANDIDATES` best by priority and
     // distance are kept. Only those get the line of sight, the pile cap and the full score.
-    let mut near: [Option<(i32, f64, &Seen, Notice)>; TARGET_CANDIDATES] = [None; TARGET_CANDIDATES];
+    let mut near: [Option<(i32, f64, &'a Seen, Notice)>; TARGET_CANDIDATES] = [None; TARGET_CANDIDATES];
     for s in p.others {
         if only.is_some_and(|id| s.id != id) {
             continue;
@@ -279,7 +292,7 @@ fn best_candidate(bot: &mut Bot, p: &Perception, squad: &Squad, only: Option<i32
             near[slot] = Some((prio, key, s, notice));
         }
     }
-    let mut best: Option<(i32, f64, Seen)> = None;
+    let mut best: Option<(i32, f64, &'a Seen)> = None;
     for (prio, _, s, notice) in near.into_iter().flatten() {
         if notice == Notice::IfSeen && !sees(bot, p, s) {
             continue;
@@ -305,7 +318,7 @@ fn best_candidate(bot: &mut Bot, p: &Perception, squad: &Squad, only: Option<i32
             score -= 4.0;
         }
         if best.as_ref().is_none_or(|(bp, bs, _)| prio < *bp || (prio == *bp && score < *bs)) {
-            best = Some((prio, score, s.clone()));
+            best = Some((prio, score, s));
         }
     }
     best
@@ -360,6 +373,8 @@ pub fn fight(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, squad: &
             since_swing: bot.fight.since_swing,
             ..Default::default()
         };
+        // The perceived-position history belongs to the old fight: a new target is aimed at where it is.
+        bot.history.clear();
     }
     d.mode = "fight";
     let inv = &p.me.inventory;
@@ -418,7 +433,7 @@ pub fn fight(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, squad: &
     if st.b("retreat")
         && (p.me.health as f64) <= st.f("retreat-health") + temper.heal_shift
         && !temper.heal_in_place
-        && (can_recover(p) || race(p, t) < -0.3)
+        && (can_recover(bot, p) || race(p, t) < -0.3)
     {
         d.mode = "retreat";
         let away = bot.body.pos + (bot.body.pos - t.pos).horizontal().normalize() * 8.0;
@@ -524,10 +539,10 @@ pub fn fight(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, squad: &
 }
 
 /// Something to heal or escape with: a healing potion, a golden apple, a totem or a pearl off cooldown.
-fn can_recover(p: &Perception) -> bool {
+fn can_recover(bot: &Bot, p: &Perception) -> bool {
     let inv = &p.me.inventory;
     inv.count(|s| items::is_healing_potion(s) || s.is("golden_apple") || s.is("enchanted_golden_apple") || s.is("totem_of_undying")) > 0
-        || (inv.has("ender_pearl") && p.me.cooldown("ender_pearl") == 0)
+        || (inv.has("ender_pearl") && bot.cooldown_left(p, "ender_pearl") == 0)
 }
 
 /// The health race: positive when the bot is ahead.
@@ -600,13 +615,14 @@ fn melee(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, dist: f64, f
     }
 
     // The mace: a wind charge at its own feet to go up, the smash on the way down.
-    if mace_play && st.b("windcharge-mace") && bot.body.on_ground && flat < 4.5 && bot.ready("wind-launch", tick) && p.me.cooldown("wind_charge") == 0 {
+    if mace_play && st.b("windcharge-mace") && bot.body.on_ground && flat < 4.5 && bot.ready("wind-launch", tick) && bot.cooldown_left(p, "wind_charge") == 0 {
         if let Some(wc) = inv.find(true, |s| s.is("wind_charge")) {
             if bot.rng.chance(0.5 + 0.5 * st.knob("technique")) {
                 select(d, inv, wc);
                 d.pitch = if st.b("wc-crouch-boost") { 89.0 } else { 80.0 };
                 d.input.jump = true;
                 d.actions.push(Action::Use(Hand::Main));
+                bot.note_used("wind_charge", tick);
                 bot.cool("wind-launch", tick, 40);
                 bot.last_call = "launching for a smash".into();
                 d.mode = "mace-launch";
@@ -659,6 +675,13 @@ fn melee(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, dist: f64, f
         let ring = if !charged && st.b("spacing") { (reach + 0.4).max(standoff) } else { standoff };
         goal = t.pos + Vec3::new(-ang.sin(), 0.0, ang.cos()) * ring;
         sprint = false;
+        // About to land a charged hit it keeps sprinting through the swing (the knockback bonus);
+        // a crit hopper and a falling crit stay off it (a vanilla crit needs no sprint).
+        let hopper = st.b("crits") && !mace_play && !bot.personality.comboer;
+        if st.b("sprint-hits") && charged && dist <= reach + 0.5 && !hopper && !airborne_crit {
+            goal = t.pos;
+            sprint = true;
+        }
         // A comboer lands its charged hit sprinting (the extra knockback); the ring is for the recharge.
         if bot.personality.comboer && charged && dist <= reach + 0.5 {
             goal = t.pos;
@@ -696,6 +719,10 @@ fn melee(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, dist: f64, f
     }
     let _ = &goal;
     bot.walk_to(p, d, goal, sprint);
+    // The d-tap stop-sprint comes on the tick the delayed attack goes out (after the hit, not before).
+    if bot.ready_at.get("d-tap-at").is_some_and(|&at| at == tick) {
+        d.input.sprint = false;
+    }
     if flat > 3.0 && bot.body.pos.y + 2.0 < t.pos.y {
         let extra = Vec::new();
         bot.build_if_blocked(p, d, t.pos, &extra);
@@ -703,11 +730,25 @@ fn melee(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, dist: f64, f
 
     // Jump crits: a hop timed so the swing lands falling with a full meter.
     let crit_ready_soon = bot.fight.since_swing as f64 + 6.0 >= cd;
+    // Hit select: no swing into a raised shield without an axe (and no hop for it either).
+    let axe_out = held_after.is_some_and(|s| items::weapon(&s.id).kind == WeaponKind::Axe);
+    let select_hold = st.b("hit-select") && t.blocking && !axe_out && tick >= bot.fight.shield_down_until;
     let mut hopping = false;
-    if st.b("crits") && bot.body.on_ground && dist <= reach + 1.2 && crit_ready_soon && !mace_play && !bot.personality.comboer {
+    if st.b("crits") && bot.body.on_ground && dist <= reach + 1.2 && crit_ready_soon && !mace_play && !bot.personality.comboer && !select_hold {
         d.input.jump = true;
         d.input.sprint = false;
         hopping = true;
+    }
+    // Jump reset: hurt this tick, on the ground, in melee: a hop takes the sting out of the knockback.
+    if !hopping
+        && st.b("jump-reset")
+        && !mace_play
+        && bot.body.on_ground
+        && dist <= reach + 1.5
+        && p.events.iter().any(|e| matches!(e, Event::Hurt { by, .. } if *by > 0))
+        && bot.rng.chance(0.3 + 0.7 * st.knob("technique"))
+    {
+        d.input.jump = true;
     }
 
     // The swing.
@@ -724,9 +765,7 @@ fn melee(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, dist: f64, f
         // Just hopped for a crit: the swing comes on the way down.
         return;
     }
-    // Hit select: no swing into a raised shield without an axe.
-    let axe_out = held_after.is_some_and(|s| items::weapon(&s.id).kind == WeaponKind::Axe);
-    if st.b("hit-select") && t.blocking && !axe_out && tick >= bot.fight.shield_down_until {
+    if select_hold {
         return;
     }
     // Crit timing: wait for the fall when a crit is on (within the knob's slack).
@@ -760,9 +799,19 @@ fn melee(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, dist: f64, f
                 bot.ready_at.insert("wind-launch", tick + 1);
             }
         }
-        // A sprint reset after the hit (w-tap / d-tap).
+        // A sprint reset after the hit (w-tap / d-tap): on the tick the delayed attack goes out.
         if st.b("d-tap") {
-            d.input.sprint = false;
+            let ping = (st.f("ping-millis") / 50.0).round() as u64;
+            if ping == 0 {
+                d.input.sprint = false;
+            } else {
+                bot.ready_at.insert("d-tap-at", tick + ping);
+            }
+        }
+        // The shield comes down right after its own swing.
+        if st.b("shield-lower-after-swing") && matches!(bot.busy, Some(Busy::Blocking { .. })) {
+            bot.send_late(tick, Action::Release);
+            bot.busy = None;
         }
     } else {
         bot.send_late(tick, Action::Swing(Hand::Main));
@@ -855,9 +904,8 @@ fn ranged(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, flat: f64, 
 pub fn arrow_pitch(from: Vec3, to: Vec3, speed: f64, gravity: f64, drag: f64) -> Option<f32> {
     let h = (to - from).horizontal_length();
     let dy = to.y - from.y;
-    let mut best: Option<(f64, f32)> = None;
-    let mut pitch = -60.0f32;
-    while pitch <= 60.0 {
+    // The height error where a flight at `pitch` crosses the horizontal distance.
+    let miss = |pitch: f32| -> Option<f64> {
         let r = (pitch as f64).to_radians();
         let (mut vx, mut vy) = (speed * r.cos(), -speed * r.sin());
         let (mut x, mut y) = (0.0, 0.0);
@@ -867,22 +915,40 @@ pub fn arrow_pitch(from: Vec3, to: Vec3, speed: f64, gravity: f64, drag: f64) ->
             vx *= drag;
             vy = vy * drag - gravity;
             if x >= h {
-                let err = (y - dy).abs();
-                if best.is_none_or(|(e, _)| err < e) {
-                    best = Some((err, pitch));
-                }
-                break;
+                return Some((y - dy).abs());
+            }
+        }
+        None
+    };
+    // A coarse pass every 2 degrees, then half-degree steps around the best one.
+    let mut best: Option<(f64, f32)> = None;
+    let mut pitch = -60.0f32;
+    while pitch <= 60.0 {
+        if let Some(err) = miss(pitch) {
+            if best.is_none_or(|(e, _)| err < e) {
+                best = Some((err, pitch));
+            }
+        }
+        pitch += 2.0;
+    }
+    let (_, coarse) = best?;
+    let mut fine = best;
+    let mut pitch = (coarse - 1.5).max(-60.0);
+    while pitch <= (coarse + 1.5).min(60.0) {
+        if let Some(err) = miss(pitch) {
+            if fine.is_none_or(|(e, _)| err < e) {
+                fine = Some((err, pitch));
             }
         }
         pitch += 0.5;
     }
-    best.filter(|(e, _)| *e < 1.5).map(|(_, p)| p)
+    fine.filter(|(e, _)| *e < 1.5).map(|(_, p)| p)
 }
 
 /// An ender pearl toward a point (escape or chase). False when it can't throw one now.
 pub fn pearl(bot: &mut Bot, p: &Perception, d: &mut Decision, to: Vec3, why: &'static str) -> bool {
     let tick = p.tick;
-    if !bot.ready("pearl", tick) || p.me.cooldown("ender_pearl") > 0 {
+    if !bot.ready("pearl", tick) || bot.cooldown_left(p, "ender_pearl") > 0 {
         return false;
     }
     let inv = &p.me.inventory;
@@ -896,6 +962,7 @@ pub fn pearl(bot: &mut Bot, p: &Perception, d: &mut Decision, to: Vec3, why: &'s
     d.yaw = yaw_to(eye, to);
     d.pitch = pitch + ((1.0 - bot.settings.knob("aim")) * 4.0 * bot.rng.signed()) as f32;
     d.actions.push(Action::Use(Hand::Main));
+    bot.note_used("ender_pearl", tick);
     bot.cool("pearl", tick, bot.settings.i("pearl-cooldown").max(20) as u64);
     bot.last_call = why.replace('-', " ");
     true

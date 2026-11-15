@@ -152,12 +152,14 @@ pub fn best_against(p: &Perception, t: &Seen, hotbar_only: bool) -> Option<usize
     let inv = &p.me.inventory;
     let end = if hotbar_only { 9 } else { 36 };
     (0..end)
-        .filter(|&i| inv.slots[i].as_ref().is_some_and(|s| !matches!(items::weapon(&s.id).kind, WeaponKind::Hand | WeaponKind::Other)))
-        .map(|i| {
-            let s = inv.slots[i].as_ref().unwrap();
+        .filter_map(|i| {
+            let s = inv.slots[i].as_ref()?;
             let w = items::weapon(&s.id);
+            if matches!(w.kind, WeaponKind::Hand | WeaponKind::Other) {
+                return None;
+            }
             let through = items::damage_after_armor(items::melee_damage(Some(s)), t.armor, 0.0, 0);
-            (i, through * w.speed.min(1.6))
+            Some((i, through * w.speed.min(1.6)))
         })
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i)

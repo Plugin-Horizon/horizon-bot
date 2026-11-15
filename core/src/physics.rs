@@ -83,6 +83,10 @@ pub struct Body {
     pub levitation: u32,
     /// Gliding on an elytra.
     pub gliding: bool,
+    /// Set by the glue when the engine plays this bot's move and overwrites pos/vel/on_ground afterwards
+    /// (`apply_engine_result`): `tick` then skips the collision move and edge back-off (their result would be
+    /// thrown away) and only keeps the contact flags and velocity bookkeeping. Prediction clones ignore it.
+    pub engine_plays: bool,
 }
 
 impl Body {
@@ -107,6 +111,7 @@ impl Body {
             slow_falling: false,
             levitation: 0,
             gliding: false,
+            engine_plays: false,
         }
     }
 
@@ -158,7 +163,7 @@ impl Body {
             // Water and lava take the same push (vanilla's 0.02).
             let speed = 0.02;
             self.move_relative(fwd, strafe, speed);
-            self.do_move(world);
+            self.move_body(world);
             let damp = if self.in_water { 0.8 } else { 0.5 };
             self.vel = Vec3::new(self.vel.x * damp, self.vel.y * 0.8, self.vel.z * damp);
             self.vel.y -= if self.in_water { 0.005 } else { 0.02 };
@@ -191,10 +196,10 @@ impl Body {
                     self.vel.y = 0.0;
                 }
             }
-            if self.sneaking && self.on_ground {
+            if self.sneaking && self.on_ground && !self.engine_plays {
                 self.back_off_edges(world);
             }
-            self.do_move(world);
+            self.move_body(world);
             if self.on_climbable && (self.horizontal_collision || input.jump) {
                 self.vel.y = 0.2;
             }
@@ -222,6 +227,29 @@ impl Body {
                 *v = 0.0;
             }
         }
+    }
+
+    /// The collision move, unless the engine plays it (see `engine_plays`).
+    fn move_body(&mut self, world: &dyn BlockView) {
+        if !self.engine_plays {
+            self.do_move(world);
+        }
+    }
+
+    /// Takes the engine's answer for this tick (position, velocity, contacts) and keeps `fall_distance` right
+    /// from its height change, as `do_move` would have: landing resets it, a drop adds to it. Call instead of
+    /// assigning the fields when `engine_plays` is set (the body's position is still last tick's here).
+    pub fn apply_engine_result(&mut self, pos: Vec3, vel: Vec3, on_ground: bool, horizontal_collision: bool) {
+        let dy = pos.y - self.pos.y;
+        if on_ground {
+            self.fall_distance = 0.0;
+        } else if dy < 0.0 && !self.gliding && !self.on_climbable && !self.in_web {
+            self.fall_distance -= dy;
+        }
+        self.pos = pos;
+        self.vel = vel;
+        self.on_ground = on_ground;
+        self.horizontal_collision = horizontal_collision;
     }
 
     fn jump(&mut self) {
@@ -408,6 +436,7 @@ impl Body {
     /// Where the body would be after `ticks` with no input (for fall and landing prediction).
     pub fn predict_fall(&self, world: &dyn BlockView, ticks: u32) -> (Vec3, Option<u32>) {
         let mut b = self.clone();
+        b.engine_plays = false;
         for t in 0..ticks {
             b.tick(&Input::default(), world);
             if b.on_ground || b.in_water {
@@ -547,6 +576,26 @@ mod tests {
             b.tick(&i, &w);
         }
         assert!(b.on_ground && b.pos.y > 63.9, "{:?}", b.pos);
+    }
+
+    #[test]
+    fn engine_played_body_skips_the_collision_move_and_counts_the_fall() {
+        let w = MapWorld::flat(40);
+        let mut b = Body::new(Vec3::new(0.5, 60.0, 0.5));
+        b.engine_plays = true;
+        b.tick(&Input::default(), &w);
+        // The core did not move it ...
+        assert!((b.pos.y - 60.0).abs() < 1e-12 && (b.pos.x - 0.5).abs() < 1e-12);
+        // ... the engine's answer is taken and the fall measured from its height change.
+        b.apply_engine_result(Vec3::new(0.5, 59.5, 0.5), Vec3::new(0.0, -0.5, 0.0), false, false);
+        assert!((b.fall_distance - 0.5).abs() < 1e-9);
+        b.apply_engine_result(Vec3::new(0.5, 41.0, 0.5), Vec3::ZERO, true, false);
+        assert_eq!(b.fall_distance, 0.0);
+        // A prediction from an engine-played body still simulates (clutch / smash).
+        b.pos = Vec3::new(0.5, 60.0, 0.5);
+        b.on_ground = false;
+        let (end, t) = b.predict_fall(&w, 80);
+        assert!(t.is_some() && end.y < 45.0, "{end:?} {t:?}");
     }
 
     #[test]

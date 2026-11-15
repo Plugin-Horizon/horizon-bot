@@ -320,6 +320,7 @@ fn admit_queued(game: &mut Game<'_>) {
             }
         }
         if g.join_queue.is_empty() {
+            SPAWN_WAIT.with(|w| w.borrow_mut().clear());
             return;
         }
         let per_tick = g.plugin.as_ref().map_or(pc::config::DEFAULT_JOINS_PER_TICK, |p| p.config.joins_per_tick);
@@ -328,26 +329,46 @@ fn admit_queued(game: &mut Game<'_>) {
         let mut joined = 0u32;
         // A bot whose chunk is not loaded yet waits (and the chunk is asked for): placed there, it would
         // fall through the empty ground and die. Waiting bots go to the back; after 600 ticks one comes in anyway.
+        // The wait is counted per (dimension, chunk) once a tick, and the chunk is asked about and asked for
+        // once a tick, however many bots wait on it: all of them come in the tick it is loaded.
         let mut waiting = Vec::new();
         let mut scanned = 0usize;
         let total = g.join_queue.len();
+        let mut chunks: HashMap<String, HashMap<(i32, i32), ChunkWait>> = SPAWN_WAIT.with(|w| {
+            std::mem::take(&mut *w.borrow_mut())
+                .into_iter()
+                .map(|(d, m)| (d, m.into_iter().map(|(c, waited)| (c, ChunkWait { waited, ..Default::default() })).collect()))
+                .collect()
+        });
+        // The saved player files of the world, listed once (lazily), so a join removes only those that exist.
+        let mut saved: Option<[std::collections::HashSet<std::ffi::OsString>; 2]> = None;
         while scanned < total && pc::config::may_join_more(per_tick, joined, started.elapsed().as_secs_f64() * 1000.0) {
             scanned += 1;
             let Some((name, uuid, skin, spawn)) = g.join_queue.pop_front() else { break };
             if let Some((dim, pos, _)) = &spawn {
                 let chunk = [(pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4];
-                if !game.native_chunk_is_loaded(dim, chunk) {
-                    let waited = g.chunk_wait.entry(name.to_ascii_lowercase()).or_insert(0);
-                    *waited += 1;
-                    if *waited < 600 {
-                        if *waited % 20 == 1 {
+                if !chunks.contains_key(dim.as_str()) {
+                    chunks.insert(dim.clone(), HashMap::new());
+                }
+                let Some(by_dim) = chunks.get_mut(dim.as_str()) else {
+                    waiting.push((name, uuid, skin, spawn));
+                    continue;
+                };
+                let cw = by_dim.entry((chunk[0], chunk[1])).or_default();
+                let loaded = *cw.loaded.get_or_insert_with(|| game.native_chunk_is_loaded(dim, chunk));
+                if !loaded {
+                    if !cw.ticked {
+                        cw.ticked = true;
+                        cw.waited += 1;
+                        if cw.waited % 20 == 1 {
                             game.native_chunk_load_request("horizonbot:spawn", dim, chunk);
                         }
+                    }
+                    if cw.waited < 600 {
                         waiting.push((name, uuid, skin, spawn));
                         continue;
                     }
                 }
-                g.chunk_wait.remove(&name.to_ascii_lowercase());
                 // Held while the bot joins and finds its feet.
                 g.held_chunks.insert((dim.clone(), chunk[0], chunk[1]), 400);
                 game.native_chunk_load_request("horizonbot:spawn", dim, chunk);
@@ -357,8 +378,21 @@ fn admit_queued(game: &mut Game<'_>) {
             // dead and was kicked again.
             if let Some(dir) = game.native_world_dir() {
                 let id = pc::stats::uuid_text(uuid);
-                for (sub, ext) in [("players/data", "dat"), ("players/data", "dat_old"), ("playerdata", "dat"), ("playerdata", "dat_old")] {
-                    let _ = std::fs::remove_file(dir.join(sub).join(format!("{id}.{ext}")));
+                let subs = ["players/data", "playerdata"];
+                let sets = saved.get_or_insert_with(|| {
+                    subs.map(|sub| {
+                        std::fs::read_dir(dir.join(sub))
+                            .map(|rd| rd.flatten().map(|e| e.file_name()).collect::<std::collections::HashSet<std::ffi::OsString>>())
+                            .unwrap_or_default()
+                    })
+                });
+                for (i, sub) in subs.iter().enumerate() {
+                    for ext in ["dat", "dat_old"] {
+                        let file = format!("{id}.{ext}");
+                        if sets[i].contains(std::ffi::OsStr::new(&file)) {
+                            let _ = std::fs::remove_file(dir.join(sub).join(&file));
+                        }
+                    }
                 }
             }
             // Announced before the join, so the hub makes the bot a fake player from its first packet,
@@ -378,7 +412,30 @@ fn admit_queued(game: &mut Game<'_>) {
             joined += 1;
         }
         g.join_queue.extend(waiting);
+        // Only the chunks still waited on are kept.
+        let kept: HashMap<String, HashMap<(i32, i32), u32>> = chunks
+            .into_iter()
+            .map(|(d, m)| (d, m.into_iter().filter(|(_, cw)| cw.loaded == Some(false)).map(|(c, cw)| (c, cw.waited)).collect::<HashMap<_, _>>()))
+            .filter(|(_, m)| !m.is_empty())
+            .collect();
+        SPAWN_WAIT.with(|w| *w.borrow_mut() = kept);
     });
+}
+
+/// One chunk a queued bot waits on, during one `admit_queued` call.
+#[derive(Default)]
+struct ChunkWait {
+    /// Ticks waited so far.
+    waited: u32,
+    /// Whether it is loaded (asked once a call).
+    loaded: Option<bool>,
+    /// The wait was counted in this call.
+    ticked: bool,
+}
+
+thread_local! {
+    /// Ticks the queued bots have waited on each (dimension, chunk) still not loaded.
+    static SPAWN_WAIT: RefCell<HashMap<String, HashMap<(i32, i32), u32>>> = RefCell::new(HashMap::new());
 }
 
 thread_local! {
@@ -428,7 +485,7 @@ fn answer_server(game: &mut Game<'_>) {
     let kicked: Vec<(u128, Option<String>)> = pb::with(|g| {
         let mut out: Vec<(u32, S)> = Vec::new();
         let mut moved: Vec<(String, Option<Vec3>, Option<Vec3>)> = Vec::new();
-        let mut kicked: Vec<u128> = Vec::new();
+        let mut kicked: Vec<(u128, bool)> = Vec::new();
         // Knockback the server sent: the engine's own momentum for the bot's next tick starts from it.
         let mut pushed: Vec<(u128, [f64; 3])> = Vec::new();
         for c in g.conns.iter_mut() {
@@ -441,9 +498,11 @@ fn answer_server(game: &mut Game<'_>) {
                 let bodies = match o {
                     horizon_client::lan::Out::Packet(b) => vec![b],
                     horizon_client::lan::Out::Packets(v) => v,
-                    horizon_client::lan::Out::Disconnect(_) => {
+                    horizon_client::lan::Out::Disconnect(reason) => {
                         c.dead = true;
-                        kicked.push(c.uuid);
+                        // The server's shutdown kicks everyone: such a bot stays in `bots.yml` for `bots-relog`.
+                        let shutdown = format!("{reason:?}").contains("server_shutdown");
+                        kicked.push((c.uuid, shutdown));
                         continue;
                     }
                 };
@@ -509,8 +568,8 @@ fn answer_server(game: &mut Game<'_>) {
         // packet: the server then takes the player out and says it left (not a quiet leave).
         kicked
             .into_iter()
-            .map(|uuid| {
-                let name = g.plugin.as_mut().and_then(|p| p.kicked(uuid));
+            .map(|(uuid, shutdown)| {
+                let name = if shutdown { None } else { g.plugin.as_mut().and_then(|p| p.kicked(uuid)) };
                 pb::disconnect(g, uuid);
                 (uuid, name)
             })
@@ -532,6 +591,9 @@ thread_local! {
     /// and every line of sight), and was the glue's largest cost. A state id means the same for
     /// as long as the server runs.
     static STATES: RefCell<Vec<Option<pc::world::Block>>> = const { RefCell::new(Vec::new()) };
+    /// The same by state id as `Copy` flags (what standing, steps and sight lines read): no clone of a block, no
+    /// shared-pointer count, no counter.
+    static STATE_FLAGS: RefCell<Vec<Option<pc::world::BlockFlags>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The level in place as a bot reads it.
@@ -575,6 +637,50 @@ impl pc::world::BlockView for LevelView<'_, '_> {
                 m.resize(idx + 1, None);
             }
             m[idx].get_or_insert_with(|| pc::world::classify(&self.game.state_string(state))).clone()
+        })
+    }
+
+    fn flags(&self, x: i32, y: i32, z: i32) -> pc::world::BlockFlags {
+        const AIR: pc::world::BlockFlags = pc::world::BlockFlags {
+            passable: true,
+            harmful: false,
+            cobweb: false,
+            climbable: false,
+            unloaded: false,
+            fluid: pc::world::Fluid::None,
+            has_top: false,
+            shape: pc::world::ShapeKind::Empty,
+        };
+        // The unknown: not passable, nothing to stand in (`Block::unloaded`).
+        const UNLOADED: pc::world::BlockFlags = pc::world::BlockFlags {
+            passable: false,
+            harmful: false,
+            cobweb: false,
+            climbable: false,
+            unloaded: true,
+            fluid: pc::world::Fluid::None,
+            has_top: true,
+            shape: pc::world::ShapeKind::Full,
+        };
+        if y < self.bottom || y >= self.top {
+            return AIR;
+        }
+        let world = &self.game.world;
+        let key = (x >> 4, z >> 4);
+        if self.last_chunk.get() != key {
+            if !world.chunks.contains_key(&key) {
+                return UNLOADED;
+            }
+            self.last_chunk.set(key);
+        }
+        let state = world.block(x, y, z);
+        let idx = state.0 as usize;
+        STATE_FLAGS.with(|m| {
+            let mut m = m.borrow_mut();
+            if idx >= m.len() {
+                m.resize(idx + 1, None);
+            }
+            *m[idx].get_or_insert_with(|| pc::world::classify(&self.game.state_string(state)).flags())
         })
     }
 }
@@ -627,6 +733,8 @@ struct BotRef {
     name: String,
     key: String,
     slot: usize,
+    /// How far this bot perceives (read from its settings as the tick begins).
+    reach: f64,
 }
 
 thread_local! {
@@ -714,6 +822,8 @@ fn build_inventory(
 
 /// How far a bot hears sprinting players (`events_for`).
 const HEARD_REACH: f64 = 33.0;
+/// The most players one bot perceives at once (the nearest); see the think loop.
+const NEAREST_SEEN: usize = 32;
 
 /// Adds the player named `name` (any case) to `out`, if one is on. The name table is made on first use.
 fn add_named(names: &mut Option<HashMap<String, u32>>, seen: &[Seen], players: &[u32], name: &str, out: &mut Vec<u32>) {
@@ -812,7 +922,11 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
                 .iter()
                 .enumerate()
                 .filter(|(_, c)| !c.ghost)
-                .map(|(slot, c)| BotRef { uuid: c.uuid, conn: c.conn, name: c.name.clone(), key: c.key.clone(), slot })
+                .map(|(slot, c)| {
+                    // How far a bot perceives: the farthest it can notice a target, and a margin.
+                    let reach = g.plugin.as_ref().and_then(|p| p.bots.get(&c.key)).map_or(48.0, |l| l.bot.settings.f("max-target-distance").max(16.0) + 16.0);
+                    BotRef { uuid: c.uuid, conn: c.conn, name: c.name.clone(), key: c.key.clone(), slot, reach }
+                })
                 .collect(),
             g.last_damage.clone(),
         )
@@ -824,7 +938,7 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
     let perceive_span = horizon_client::spans::guard("horizonbot_perceive");
     let mut seen: Vec<Seen> = Vec::new();
     let mut selves: HashMap<u128, (u64, SelfView)> = SELVES.with(|s| std::mem::take(&mut *s.borrow_mut()));
-    let mut ground: Vec<Ground> = Vec::new();
+    let mut bot_cells: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
     {
         let Some(host) = game.lan.as_ref() else { return };
         // The glue stays locked while the guests are read (nothing in the loop takes it): the factions
@@ -860,8 +974,10 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
                     max_health: 20.0,
                     armor,
                     totem_shown: held.as_deref() == Some("minecraft:totem_of_undying") || offhand.as_deref() == Some("minecraft:totem_of_undying"),
-                    // GAP: no "is blocking" on a guest; a shield in hand while using is the best read.
-                    blocking: offhand.as_deref() == Some("minecraft:shield") && gst.living_flags & 1 != 0,
+                    // A guest has no "is blocking": the shield in the offhand while the offhand is the hand in
+                    // use (living flags: bit 0 = using an item, bit 1 = that item is the offhand's), so eating
+                    // or drawing a bow in the main hand is not blocking.
+                    blocking: offhand.as_deref() == Some("minecraft:shield") && gst.living_flags & 3 == 3,
                     sneaking: gst.sneaking,
                     sprinting: gst.sprinting,
                     invisible: effects.iter().any(|e| e.id.ends_with("invisibility")),
@@ -878,6 +994,7 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
                     using: gst.living_flags & 1 != 0,
                 });
                 if is_bot {
+                    bot_cells.insert(((gst.position[0].floor() as i32) >> 4, (gst.position[2].floor() as i32) >> 4));
                     // The bot's view of itself is kept: only what changes every tick is written again, and
                     // the inventory only when its fingerprint changed.
                     let fp = inventory_fp(&gst.inventory, &gst.armor, &gst.offhand, gst.selected, &gst.ender_items);
@@ -896,7 +1013,21 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
                     view.game_mode = gst.game_mode;
                     // VERIFY: `PlayerMotion::fire_ticks` (as `SavedBody::of` reads it).
                     view.on_fire = gst.motion.as_ref().is_some_and(|m| m.fire_ticks > 0);
-                    // GAP: item cooldowns of a guest are not read here (the map stays empty).
+                    // Item cooldowns of the bot (the engine keeps them per connection): only the few items the
+                    // brain asks about, in ticks left. The shield's counter is the engine's own (an axe's
+                    // disabling); the others are percent of their known length.
+                    view.cooldowns.clear();
+                    if let Some(play) = host.play.get(&gst.conn) {
+                        if play.shield_cooldown > 0 {
+                            view.cooldowns.insert("minecraft:shield".to_owned(), play.shield_cooldown);
+                        }
+                        for (item, length) in [("minecraft:ender_pearl", 20.0_f32), ("minecraft:wind_charge", 10.0)] {
+                            let left = (play.cooldowns.percent(item, 0.0) * length).ceil() as u32;
+                            if left > 0 {
+                                view.cooldowns.insert(item.to_owned(), left);
+                            }
+                        }
+                    }
                     if view.dimension != gst.dimension {
                         view.dimension = gst.dimension.clone();
                     }
@@ -906,7 +1037,22 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
             }
         });
     }
+    // Only the mobs a bot can perceive (or hear) matter: those in a cell within the farthest reach of a
+    // bot's cell. The cells are expanded once, so each mob is one lookup.
+    let ask_max = bots.iter().map(|b| b.reach.max(HEARD_REACH)).fold(HEARD_REACH, f64::max);
+    let span_cells = (ask_max / 16.0).floor() as i32 + 1;
+    let mut mob_cells: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+    for &(bx, bz) in &bot_cells {
+        for cx in bx - span_cells..=bx + span_cells {
+            for cz in bz - span_cells..=bz + span_cells {
+                mob_cells.insert((cx, cz));
+            }
+        }
+    }
     for m in game.native_mobs(dimension) {
+        if !mob_cells.contains(&((m.pos[0].floor() as i32) >> 4, (m.pos[2].floor() as i32) >> 4)) {
+            continue;
+        }
         let (w, h, hostile, passive) = mob_shape(&m.kind);
         seen.push(Seen {
             id: m.id as i32,
@@ -955,21 +1101,30 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
             spot_grid.entry(((at.x.floor() as i32) >> 4, (at.z.floor() as i32) >> 4)).or_default().push(at);
         }
     }
-    // VERIFY: native_item_entities(dimension, min, max) (API 41).
-    for it in game.native_item_entities(dimension, [-3.0e7, -4096.0, -3.0e7], [3.0e7, 4096.0, 3.0e7]) {
-        let at = Vec3::from_array(it.position);
-        let (cx, cz) = ((at.x.floor() as i32) >> 4, (at.z.floor() as i32) >> 4);
-        let near = (cx - 1..=cx + 1).any(|x| {
-            (cz - 1..=cz + 1).any(|z| {
-                spot_grid.get(&(x, z)).is_some_and(|spots| {
-                    spots.iter().any(|b| (at.x - b.x).abs() <= 8.0 && (at.y - b.y).abs() <= 4.0 && (at.z - b.z).abs() <= 8.0)
-                })
-            })
-        });
-        if near {
-            ground.push(Ground { id: it.id as i32, item: it.stack.item.to_string(), count: it.stack.count, pos: at });
+    // Rescanned every 5 ticks (a bot looting reads a list at most 5 ticks old); the last list is kept per level.
+    let cached = GROUND.with(|c| c.borrow_mut().remove(dimension));
+    let (ground_tick, ground): (u64, Vec<Ground>) = match cached {
+        Some((t, list)) if tick.wrapping_sub(t) < 5 => (t, list),
+        _ => {
+            let mut list: Vec<Ground> = Vec::new();
+            // VERIFY: native_item_entities(dimension, min, max) (API 41).
+            for it in game.native_item_entities(dimension, [-3.0e7, -4096.0, -3.0e7], [3.0e7, 4096.0, 3.0e7]) {
+                let at = Vec3::from_array(it.position);
+                let (cx, cz) = ((at.x.floor() as i32) >> 4, (at.z.floor() as i32) >> 4);
+                let near = (cx - 1..=cx + 1).any(|x| {
+                    (cz - 1..=cz + 1).any(|z| {
+                        spot_grid.get(&(x, z)).is_some_and(|spots| {
+                            spots.iter().any(|b| (at.x - b.x).abs() <= 8.0 && (at.y - b.y).abs() <= 4.0 && (at.z - b.z).abs() <= 8.0)
+                        })
+                    })
+                });
+                if near {
+                    list.push(Ground { id: it.id as i32, item: it.stack.item.to_string(), count: it.stack.count, pos: at });
+                }
+            }
+            (tick, list)
         }
-    }
+    };
     // Where whoever struck last tick stood, for the bots that hear it: (victim, striker, position).
     let heard: Vec<(i32, i32, Vec3)> = damage.iter().filter_map(|&(victim, causing, _)| by_id.get(&causing).map(|&i| (victim, causing, seen[i as usize].pos))).collect();
     drop(perceive_span);
@@ -981,15 +1136,15 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
         let Some(plugin) = g.plugin.as_mut() else { return out };
         let mut idx: Vec<u32> = Vec::new();
         let mut near: Vec<u32> = Vec::new();
+        let mut keyed: Vec<(f64, u32)> = Vec::new();
         let mut extra: Vec<u32> = Vec::new();
         let mut names: Option<HashMap<String, u32>> = None;
         for (bi, b) in bots.iter().enumerate() {
             let Some((_, me)) = selves.get(&b.uuid) else { continue };
             let Some(&mine) = by_uuid.get(&b.uuid) else { continue };
-            plugin.bot_world(&b.name, dimension);
+            plugin.bot_world_key(&b.key, dimension);
             let my_pos = seen[mine as usize].pos;
-            // How far a bot perceives: the farthest it can notice a target, and a margin.
-            let reach = plugin.bots.get(&b.key).map_or(48.0, |l| l.bot.settings.f("max-target-distance").max(16.0) + 16.0);
+            let reach = b.reach;
             // The players near it (and, for what it hears, a little farther), in the order of `seen`.
             let ask = reach.max(HEARD_REACH);
             near.clear();
@@ -1004,14 +1159,34 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
                     }
                 }
             }
-            if cells > 1 {
-                near.sort_unstable();
-            }
+            // No sort: nothing reads `near` in order, and in one arena of 1000 bots it cost ~10 % of the tick.
+            let _ = cells;
             let t_events = std::time::Instant::now();
             let events = events_for(&seen, &near, &heard, mine, &damage);
             pc::brain::prof_add(pc::brain::P_GLUE_EVENTS, t_events.elapsed().as_nanos() as u64);
             idx.clear();
-            idx.extend(near.iter().copied().filter(|&i| i != mine && seen[i as usize].pos.distance(my_pos) <= reach));
+            // Only the NEAREST_SEEN nearest players: in a crowd of hundreds the brain looks at a few anyway (its
+            // candidate scan keeps 5) and each one more costs every bot every tick. Orders, revenge and the fight
+            // target come back through `explicit_players` below. One squared distance per candidate.
+            keyed.clear();
+            let reach2 = reach * reach;
+            for &i in near.iter() {
+                if i == mine {
+                    continue;
+                }
+                let q = seen[i as usize].pos;
+                let (dx, dy, dz) = (q.x - my_pos.x, q.y - my_pos.y, q.z - my_pos.z);
+                let d2 = dx * dx + dy * dy + dz * dz;
+                if d2 <= reach2 {
+                    keyed.push((d2, i));
+                }
+            }
+            if keyed.len() > NEAREST_SEEN {
+                keyed.select_nth_unstable_by(NEAREST_SEEN, |a, b| a.0.total_cmp(&b.0));
+                keyed.truncate(NEAREST_SEEN);
+            }
+            idx.extend(keyed.iter().map(|k| k.1));
+            idx.sort_unstable();
             extra.clear();
             explicit_players(plugin, &b.key, &seen, &player_idx, &by_id, &events, &mut names, &mut extra);
             if !extra.is_empty() {
@@ -1031,16 +1206,16 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
             let p = Perception { tick, me, others: pc::brain::Others::indexed(&seen, &idx), ground: &ground, events: &events, world: &view };
             // (Per-bot spans cost a clock read, a CPU-time read and a push each, 500 times a tick: a counter instead.)
             let t_brain = std::time::Instant::now();
-            let thought = plugin.think(&b.name, &p);
+            let thought = plugin.think_key(&b.key, &b.name, &p);
             pc::brain::prof_add(pc::brain::P_GLUE_BRAIN, t_brain.elapsed().as_nanos() as u64);
-            if let Some(d) = thought {
-                let body = &plugin.bots[&b.key].bot.body;
-                out.push((bi, d, body.pos, body.on_ground, body.horizontal_collision));
+            if let Some((d, pos, on_ground, hcol)) = thought {
+                out.push((bi, d, pos, on_ground, hcol));
             }
         }
         out
     });
     drop(view);
+    GROUND.with(|c| c.borrow_mut().insert(dimension.to_owned(), (ground_tick, ground)));
     selves.retain(|u, _| pb::is_bot(*u));
     SELVES.with(|s| *s.borrow_mut() = selves);
     horizon_client::spans::counters(&[("horizonbot_block_reads", BLOCK_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed))]);
@@ -1059,6 +1234,11 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
         pc::brain::prof_add(pc::brain::P_GLUE_ACT, t_act.elapsed().as_nanos() as u64);
     }
     drop(act_span);
+}
+
+thread_local! {
+    /// The items on the ground near the bots of each level, and the tick they were listed.
+    static GROUND: RefCell<HashMap<String, (u64, Vec<Ground>)>> = RefCell::new(HashMap::new());
 }
 
 thread_local! {
@@ -1096,10 +1276,10 @@ fn engine_move(game: &mut Game<'_>, b: &BotRef, d: &pc::brain::Decision) -> Opti
     pb::with(|g| {
         if let Some(live) = g.plugin.as_mut().and_then(|p| p.bots.get_mut(&b.key)) {
             let body = &mut live.bot.body;
-            body.pos = pos;
-            body.vel = Vec3::from_array(m.velocity);
-            body.on_ground = m.on_ground;
-            body.horizontal_collision = m.horizontal_collision;
+            // The engine plays this bot's move: from now on the brain's own body skips its collision
+            // move (it was simulated and then thrown away) and takes the engine's result here.
+            body.engine_plays = true;
+            body.apply_engine_result(pos, Vec3::from_array(m.velocity), m.on_ground, m.horizontal_collision);
             body.sprinting = m.sprinting;
         }
     });
@@ -1127,9 +1307,15 @@ fn events_for(seen: &[Seen], players: &[u32], heard: &[(i32, i32, Vec3)], mine: 
             out.push(Event::Heard { pos, loud: true, by: causing });
         }
     }
+    // At most 8 sprinting players heard: a crowd would give every bot hundreds of events a tick.
+    let mut quiet = 0;
     for &i in players {
+        if quiet >= 8 {
+            break;
+        }
         let s = &seen[i as usize];
         if i != mine && s.sprinting && s.pos.distance(me.pos) <= HEARD {
+            quiet += 1;
             out.push(Event::Heard { pos: s.pos, loud: false, by: s.id });
         }
     }
@@ -1156,9 +1342,15 @@ fn act(game: &mut Game<'_>, b: &BotRef, d: pc::brain::Decision, pos: Vec3, on_gr
     if flags != input_was {
         packets.push(S::PlayerInput(play::PlayerInput { flags }));
     }
+    // A stop-sprint in the same batch as an attack goes out after it (the hit still counts as sprinting).
+    let mut stop_sprint_after: Option<i32> = None;
     if d.input.sprint != sprint_was {
         let entity = game.lan.as_ref().and_then(|h| h.hub.guest_by_uuid(uuid)).map_or(0, |g| g.entity_id);
-        packets.push(S::PlayerCommand(play::PlayerCommand { id: entity, action: if d.input.sprint { 1 } else { 2 }, data: 0 }));
+        if !d.input.sprint && d.actions.iter().any(|a| matches!(a, Action::Attack(_))) {
+            stop_sprint_after = Some(entity);
+        } else {
+            packets.push(S::PlayerCommand(play::PlayerCommand { id: entity, action: if d.input.sprint { 1 } else { 2 }, data: 0 }));
+        }
     }
     let move_flags = u8::from(on_ground) | (u8::from(hcol) << 1);
     packets.push(S::MovePlayerPosRot(play::MovePlayerPosRot { x: pos.x, y: pos.y, z: pos.z, yaw: d.yaw, pitch: d.pitch, flags: move_flags }));
@@ -1208,6 +1400,9 @@ fn act(game: &mut Game<'_>, b: &BotRef, d: pc::brain::Decision, pos: Vec3, on_gr
                 game.native_run_command(&line);
             }
         }
+    }
+    if let Some(entity) = stop_sprint_after {
+        packets.push(S::PlayerCommand(play::PlayerCommand { id: entity, action: 2, data: 0 }));
     }
     packets.push(S::ClientTickEnd(horizon_protocol::packets::Empty));
     pb::with(|g| {

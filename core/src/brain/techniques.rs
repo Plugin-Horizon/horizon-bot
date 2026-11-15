@@ -64,6 +64,7 @@ fn pearl_launch(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, flat:
                 d.yaw = yaw_to(bot.body.eye(), at);
                 d.pitch = -89.0;
                 d.actions.push(Action::Use(Hand::Main));
+                bot.note_used("wind_charge", tick);
                 bot.last_call = "pearl launch".into();
                 d.mode = "pearl-launch";
                 return true;
@@ -71,7 +72,7 @@ fn pearl_launch(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, flat:
         }
         return false;
     }
-    if !(1.5..5.0).contains(&flat) || !bot.body.on_ground || !bot.ready("pearl-launch-cd", tick) || p.me.cooldown("ender_pearl") > 0 {
+    if !(1.5..5.0).contains(&flat) || !bot.body.on_ground || !bot.ready("pearl-launch-cd", tick) || bot.cooldown_left(p, "ender_pearl") > 0 {
         return false;
     }
     let (Some(pearl), true) = (inv.find(true, |s| s.is("ender_pearl")), inv.has("wind_charge")) else { return false };
@@ -83,6 +84,7 @@ fn pearl_launch(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, flat:
     d.actions.push(Action::SelectSlot(pearl));
     d.pitch = -88.0;
     d.actions.push(Action::Use(Hand::Main));
+    bot.note_used("ender_pearl", tick);
     bot.ready_at.insert("pearl-launch", tick);
     bot.cool("pearl-launch-cd", tick, 200);
     d.mode = "pearl-launch";
@@ -122,7 +124,7 @@ fn shield_drain(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, flat:
 }
 
 fn throw_at(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, item: &str, why: &'static str, cooldown: u64) -> bool {
-    if p.me.cooldown(item) > 0 {
+    if bot.cooldown_left(p, item) > 0 {
         return false;
     }
     let Some(slot) = hotbar(bot, p, |s| s.is(item)) else { return false };
@@ -132,6 +134,7 @@ fn throw_at(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, item: &st
     d.yaw = yaw_to(eye, aim);
     d.pitch = pitch_to(eye, aim);
     d.actions.push(Action::Use(Hand::Main));
+    bot.note_used(item, p.tick);
     bot.cool(why, p.tick, cooldown);
     bot.last_call = why.replace('-', " ");
     d.mode = why;
@@ -283,12 +286,13 @@ fn spear_moves(bot: &mut Bot, p: &Perception, d: &mut Decision, t: &Seen, dist: 
     // The dash: at the top of a launch, a wind charge and the spear on the same tick.
     if (st.b("spear-dash") || st.b("spear-macing") || st.b("dash-chain")) && !bot.body.on_ground && bot.body.vel.y.abs() < 0.08 && (3.0..12.0).contains(&flat) {
         if let (Some(sp), Some(wc)) = (spear, inv.find(true, |s| s.is("wind_charge"))) {
-            if bot.ready("dash", tick) && p.me.cooldown("wind_charge") == 0 {
+            if bot.ready("dash", tick) && bot.cooldown_left(p, "wind_charge") == 0 {
                 let eye = bot.body.eye();
                 d.yaw = yaw_to(eye, t.pos);
                 d.actions.push(Action::SelectSlot(wc));
                 d.pitch = 60.0;
                 d.actions.push(Action::Use(Hand::Main));
+                bot.note_used("wind_charge", tick);
                 d.actions.push(Action::SelectSlot(sp));
                 d.actions.push(Action::Swing(Hand::Main));
                 bot.cool("dash", tick, if st.b("dash-chain") { 15 } else { 60 });

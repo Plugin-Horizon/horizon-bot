@@ -13,6 +13,33 @@ fn select(d: &mut Decision, cur: usize, slot: usize) {
     }
 }
 
+impl Bot {
+    /// Remember an item use of the bot's own. The glue never fills `SelfView::cooldowns`, so the
+    /// brain tracks the ones it cares about: ender pearl 20 ticks, wind charge 10 ticks, and
+    /// "shield" (disabled by an axe) 100 ticks. Must be called by whoever emits the throw/use.
+    pub(crate) fn note_used(&mut self, item: &str, now: u64) {
+        let (key, ticks) = match item.strip_prefix("minecraft:").unwrap_or(item) {
+            "ender_pearl" => ("used:ender_pearl", 20),
+            "wind_charge" => ("used:wind_charge", 10),
+            "shield" => ("used:shield", 100),
+            _ => return,
+        };
+        self.cool(key, now, ticks);
+    }
+
+    /// Ticks left on an item's cooldown: the larger of the engine's value and the tracked one.
+    pub(crate) fn cooldown_left(&self, p: &Perception, item: &str) -> u32 {
+        let key = match item.strip_prefix("minecraft:").unwrap_or(item) {
+            "ender_pearl" => "used:ender_pearl",
+            "wind_charge" => "used:wind_charge",
+            "shield" => "used:shield",
+            _ => return p.me.cooldown(item),
+        };
+        let tracked = self.ready_at.get(key).map_or(0, |t| t.saturating_sub(p.tick).min(u32::MAX as u64) as u32);
+        p.me.cooldown(item).max(tracked)
+    }
+}
+
 /// The MLG: falling far enough to get hurt, a bucket of water onto the landing spot inside the
 /// window; picked back up once down. A slime block, cobweb, powder snow or hay without water.
 pub fn clutch(bot: &mut Bot, p: &Perception, d: &mut Decision) -> bool {
@@ -23,6 +50,16 @@ pub fn clutch(bot: &mut Bot, p: &Perception, d: &mut Decision) -> bool {
     // A smash fall is the attack; no clutch on it.
     if bot.fight.mace_mode && bot.fight.target.is_some() {
         return false;
+    }
+    // Nothing usable in the hotbar: skip the (expensive) fall prediction.
+    {
+        let inv = &p.me.inventory;
+        let usable = inv.find(true, |s| s.is("water_bucket")).is_some()
+            || (st.b("block-clutch") && inv.find(true, |s| items::is_clutch_block(&s.id)).is_some())
+            || (st.b("wc-self-reset") && bot.cooldown_left(p, "wind_charge") == 0 && inv.find(true, |s| s.is("wind_charge")).is_some());
+        if !usable {
+            return false;
+        }
     }
     let (landing, ticks) = bot.body.predict_fall(p.world, 80);
     let Some(ticks) = ticks else { return false };
@@ -46,13 +83,14 @@ pub fn clutch(bot: &mut Bot, p: &Perception, d: &mut Decision) -> bool {
     };
     let Some(slot) = water.or(block) else {
         // No water, no block: a wind charge under itself resets the fall (`wc-self-reset`).
-        if st.b("wc-self-reset") && above < 4.0 && p.me.cooldown("wind_charge") == 0 {
+        if st.b("wc-self-reset") && above < 4.0 && bot.cooldown_left(p, "wind_charge") == 0 {
             if let Some(wc) = p.me.inventory.find(true, |s| s.is("wind_charge")) {
                 select(d, p.me.inventory.selected, wc);
                 d.pitch = 90.0;
                 d.actions.push(Action::Use(Hand::Main));
                 bot.last_call = "wind charge under itself".into();
                 d.mode = "wc-self-reset";
+                bot.note_used("wind_charge", tick);
                 return true;
             }
         }
@@ -234,6 +272,14 @@ pub fn continue_busy(bot: &mut Bot, p: &Perception, d: &mut Decision) -> bool {
             true
         }
         Some(Busy::Blocking { since }) => {
+            // Hurt by someone holding an axe while blocking: the shield is disabled for 5 s.
+            for e in p.events {
+                if let Event::Hurt { by, .. } = e {
+                    if *by != 0 && p.others.iter().any(|o| o.id == *by && o.holds("axe")) {
+                        bot.note_used("shield", tick);
+                    }
+                }
+            }
             // Lowered by heal() or fight when it is time; a shield is held at most 2 s.
             if tick > since + 40 {
                 d.actions.push(Action::Release);
@@ -273,7 +319,7 @@ pub fn heal(bot: &mut Bot, p: &Perception, d: &mut Decision, threat: Option<&See
     let close = threat.map(|t| bot.reach_to(t)).unwrap_or(99.0);
 
     // The shield against a mace coming down on it, or when hurt and pressed.
-    if st.b("auto-shield") && inv.offhand_is("shield") && p.me.cooldown("shield") == 0 {
+    if st.b("auto-shield") && inv.offhand_is("shield") && bot.cooldown_left(p, "shield") == 0 {
         let smash = threat.is_some_and(|t| t.holds("mace") && t.vel.y < -0.4 && t.pos.y > bot.body.pos.y + 2.0 && close < 5.0);
         let pressed = hp <= st.f("shield-health") && close < 3.5 && threat.is_some_and(|t| !t.blocking);
         // A jump-crit windup read from how they fight: the shield goes up early.
@@ -291,12 +337,24 @@ pub fn heal(bot: &mut Bot, p: &Perception, d: &mut Decision, threat: Option<&See
                     bot.walk_to(p, d, away, true);
                 }
             }
-        } else if (pressed || windup) && bot.rng.chance(0.4 + temper.block) {
-            raise = true;
+        } else if pressed || windup {
+            // A short reaction before the shield comes up (a quarter of the reaction time, at
+            // least one tick), as a player needs to see the threat first.
+            match bot.ready_at.get("shield-react").copied() {
+                None => {
+                    let wait = (bot.reaction_ticks() / 4).max(1);
+                    bot.cool("shield-react", tick, wait);
+                }
+                Some(at) if tick >= at && bot.rng.chance(0.4 + temper.block) => raise = true,
+                _ => {}
+            }
+        } else {
+            bot.ready_at.remove("shield-react");
         }
         if raise && !matches!(bot.busy, Some(Busy::Blocking { .. })) && bot.clutch_roll("shield", tick) {
             d.actions.push(Action::Use(Hand::Off));
             bot.busy = Some(Busy::Blocking { since: tick });
+            bot.ready_at.remove("shield-react");
             d.mode = "blocking";
             return false;
         }
@@ -545,5 +603,61 @@ mod tests {
         }
         let y = fired.expect("poured");
         assert!(y - 41.0 < 9.0, "too early: {y}");
+    }
+
+    #[test]
+    fn clutch_skips_the_fall_prediction_without_items() {
+        use crate::brain::tests::{bot_at, me_with, perceive};
+        let mut w = crate::world::MapWorld::flat(40);
+        w.floor = Some(40);
+        let mut bot = bot_at(Vec3::new(0.5, 70.0, 0.5));
+        bot.body.vel.y = -1.0;
+        bot.body.fall_distance = 20.0;
+        let me = me_with(&[(0, "stone_sword", 1)]);
+        let p = perceive(1, &me, &[], &w);
+        let mut d = Decision::default();
+        assert!(!clutch(&mut bot, &p, &mut d));
+        assert!(d.actions.is_empty());
+    }
+
+    #[test]
+    fn tracked_cooldowns_merge_with_the_engines() {
+        use crate::brain::tests::{bot_at, me_with, perceive};
+        let w = crate::world::MapWorld::flat(40);
+        let mut bot = bot_at(Vec3::new(0.5, 70.0, 0.5));
+        let mut me = me_with(&[]);
+        bot.note_used("minecraft:ender_pearl", 100);
+        bot.note_used("wind_charge", 100);
+        bot.note_used("shield", 100);
+        bot.note_used("apple", 100);
+        let p = perceive(105, &me, &[], &w);
+        assert_eq!(bot.cooldown_left(&p, "ender_pearl"), 15);
+        assert_eq!(bot.cooldown_left(&p, "wind_charge"), 5);
+        assert_eq!(bot.cooldown_left(&p, "shield"), 95);
+        let p = perceive(125, &me, &[], &w);
+        assert_eq!(bot.cooldown_left(&p, "ender_pearl"), 0);
+        assert_eq!(bot.cooldown_left(&p, "wind_charge"), 0);
+        // An engine value larger than the tracked one wins.
+        me.cooldowns.insert(crate::items::full("ender_pearl"), 7);
+        let p = perceive(125, &me, &[], &w);
+        assert_eq!(bot.cooldown_left(&p, "ender_pearl"), 7);
+    }
+
+    #[test]
+    fn an_axe_hit_while_blocking_disables_the_shield() {
+        use crate::brain::tests::{bot_at, me_with, perceive, player};
+        let w = crate::world::MapWorld::flat(40);
+        let mut bot = bot_at(Vec3::new(0.5, 70.0, 0.5));
+        bot.busy = Some(Busy::Blocking { since: 50 });
+        let me = me_with(&[]);
+        let mut foe = player(2, "Foe", Vec3::new(1.5, 70.0, 0.5));
+        foe.held = Some("minecraft:diamond_axe".into());
+        let others = [foe];
+        let events = [Event::Hurt { by: 2, amount: 9.0, kind: "player".into() }];
+        let mut p = perceive(60, &me, &others, &w);
+        p.events = &events;
+        let mut d = Decision::default();
+        continue_busy(&mut bot, &p, &mut d);
+        assert_eq!(bot.cooldown_left(&p, "shield"), 100);
     }
 }

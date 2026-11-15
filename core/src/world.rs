@@ -135,6 +135,49 @@ impl Block {
     }
 }
 
+/// What a path search or a line of sight asks of a block, as plain data: no name, no shared shape.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockFlags {
+    /// `Block::passable`.
+    pub passable: bool,
+    pub harmful: bool,
+    pub cobweb: bool,
+    pub climbable: bool,
+    pub unloaded: bool,
+    pub fluid: Fluid,
+    /// `Block::top().is_some()`: a player can stand on it.
+    pub has_top: bool,
+    /// Empty and full cubes need no box test in a line of sight; anything else does (read the block then).
+    pub shape: ShapeKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeKind {
+    Empty,
+    Full,
+    Other,
+}
+
+impl Block {
+    /// The cheap `Copy` view of this block (see `BlockFlags`).
+    pub fn flags(&self) -> BlockFlags {
+        BlockFlags {
+            passable: self.passable(),
+            harmful: self.harmful,
+            cobweb: self.cobweb,
+            climbable: self.climbable,
+            unloaded: self.unloaded,
+            fluid: self.fluid,
+            has_top: self.top().is_some(),
+            shape: match self.shape {
+                Shape::Empty => ShapeKind::Empty,
+                Shape::Full => ShapeKind::Full,
+                _ => ShapeKind::Other,
+            },
+        }
+    }
+}
+
 fn prop<'a>(state: &'a str, key: &str) -> Option<&'a str> {
     let props = state.split_once('[')?.1.strip_suffix(']')?;
     props
@@ -367,6 +410,12 @@ pub fn dimension_id(world: &str) -> String {
 pub trait BlockView {
     fn block(&self, x: i32, y: i32, z: i32) -> Block;
 
+    /// The flags of a block (what standing, steps and sight lines read). Implementations with a faster
+    /// path (a table by state id, no clone) override it; the default goes through `block`.
+    fn flags(&self, x: i32, y: i32, z: i32) -> BlockFlags {
+        self.block(x, y, z).flags()
+    }
+
     fn collision_boxes(&self, area: &Aabb, out: &mut Vec<Aabb>) {
         let (x0, y0, z0) = (area.min.x.floor() as i32, (area.min.y.floor() as i32) - 1, area.min.z.floor() as i32);
         let (x1, y1, z1) = (area.max.x.floor() as i32, area.max.y.floor() as i32, area.max.z.floor() as i32);
@@ -408,21 +457,21 @@ pub trait BlockView {
         let mut left = (0..3).map(|i| (end[i] - cell[i]).abs()).sum::<i32>() + 1;
         let mut boxes: Vec<Aabb> = Vec::new();
         loop {
-            let blk = self.block(cell[0], cell[1], cell[2]);
+            let blk = self.flags(cell[0], cell[1], cell[2]);
             if blk.unloaded {
                 return false;
             }
             match blk.shape {
-                Shape::Empty => {}
+                ShapeKind::Empty => {}
                 // The walk may visit a cell the line only touches at an edge (an exact tie): the box test decides.
-                Shape::Full => {
+                ShapeKind::Full => {
                     if segment_hits(&Aabb::block(cell[0], cell[1], cell[2], 1.0), f, dv) {
                         return false;
                     }
                 }
-                _ => {
+                ShapeKind::Other => {
                     boxes.clear();
-                    blk.boxes(cell[0], cell[1], cell[2], &mut boxes);
+                    self.block(cell[0], cell[1], cell[2]).boxes(cell[0], cell[1], cell[2], &mut boxes);
                     if boxes.iter().any(|b| segment_hits(b, f, dv)) {
                         return false;
                     }

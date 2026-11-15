@@ -27,6 +27,7 @@ force-vulnerable = true
 auth-autologin = true
 bypass-damage-protection = false
 target-scan-interval = 12  # 1 to 60
+idle-scan-interval = 4  # 1 to 60
 drop-items = true
 
 # Who a bot fights, how hard, and the special moves. Health is in half-hearts (20 = full), times in ticks.
@@ -74,6 +75,8 @@ jump-reset = true
 mirror-punish = true
 hit-select = true
 d-tap = false
+sprint-hits = true
+shield-lower-after-swing = true
 hit-web-combo = false
 sweep-hit = true
 priority-hp-target = true

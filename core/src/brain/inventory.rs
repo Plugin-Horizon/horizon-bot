@@ -79,18 +79,18 @@ impl Inventory {
     /// The best melee weapon slot (by damage per hit, Sharpness counted).
     pub fn best_weapon(&self, hotbar_only: bool, kind: Option<WeaponKind>) -> Option<usize> {
         let end = if hotbar_only { 9 } else { self.slots.len() };
+        // One weapon lookup and one damage figure per slot (not per comparison).
         (0..end)
-            .filter(|&i| {
-                self.slots[i].as_ref().is_some_and(|s| {
-                    let w = items::weapon(&s.id);
-                    w.kind != WeaponKind::Hand && w.kind != WeaponKind::Other && kind.is_none_or(|k| k == w.kind)
-                })
+            .filter_map(|i| {
+                let s = self.slots[i].as_ref()?;
+                let w = items::weapon(&s.id);
+                if w.kind == WeaponKind::Hand || w.kind == WeaponKind::Other || !kind.is_none_or(|k| k == w.kind) {
+                    return None;
+                }
+                Some((i, items::melee_damage(Some(s)) * w.speed.min(1.6)))
             })
-            .max_by(|&a, &b| {
-                let da = items::melee_damage(self.slots[a].as_ref()) * items::weapon(&self.slots[a].as_ref().unwrap().id).speed.min(1.6);
-                let db = items::melee_damage(self.slots[b].as_ref()) * items::weapon(&self.slots[b].as_ref().unwrap().id).speed.min(1.6);
-                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
     }
 
     /// For each armour slot, a carried piece better than the worn one (slot index in `slots`).
@@ -141,6 +141,20 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn best_weapon_ties_keep_the_last_and_kind_filters() {
+        let mut inv = Inventory::new();
+        inv.slots[1] = Some(Stack::new("iron_sword", 1));
+        inv.slots[4] = Some(Stack::new("iron_sword", 1));
+        inv.slots[2] = Some(Stack::new("netherite_axe", 1).with_enchant("sharpness", 3));
+        assert_eq!(inv.best_weapon(true, Some(WeaponKind::Sword)), Some(4));
+        assert_eq!(inv.best_weapon(true, Some(WeaponKind::Axe)), Some(2));
+        assert_eq!(inv.best_weapon(true, Some(WeaponKind::Mace)), None);
+        assert_eq!(inv.slots[2].as_ref().unwrap().enchant("minecraft:sharpness"), 3);
+        assert_eq!(inv.slots[2].as_ref().unwrap().enchant("sharpness"), 3);
+        assert_eq!(inv.slots[2].as_ref().unwrap().enchant("fire_aspect"), 0);
+    }
 
     #[test]
     fn finds_the_best_gear() {
