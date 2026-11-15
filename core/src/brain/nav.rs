@@ -3,6 +3,7 @@
 //! gap, pillar up, dig soft cover) when walking can't get there.
 
 use crate::math::{yaw_to, Vec3};
+use std::cell::RefCell;
 use crate::world::{BlockView, Fluid};
 use std::collections::{BinaryHeap, HashMap};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -32,19 +33,19 @@ pub type Pos = [i32; 3];
 
 pub fn standable(w: &dyn BlockView, p: Pos) -> bool {
     let [x, y, z] = p;
-    let feet = w.block(x, y, z);
-    let head = w.block(x, y + 1, z);
-    if !feet.passable() || !head.passable() || feet.harmful || head.harmful || feet.cobweb {
+    let feet = w.flags(x, y, z);
+    let head = w.flags(x, y + 1, z);
+    if !feet.passable || !head.passable || feet.harmful || head.harmful || feet.cobweb {
         return false;
     }
     if feet.fluid == Fluid::Water || feet.climbable {
         return true;
     }
-    let below = w.block(x, y - 1, z);
+    let below = w.flags(x, y - 1, z);
     if below.unloaded || below.fluid == Fluid::Lava || below.harmful {
         return false;
     }
-    below.top().is_some() || below.fluid == Fluid::Water
+    below.has_top || below.fluid == Fluid::Water
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -76,39 +77,46 @@ fn stand(w: &dyn BlockView, memo: &mut Memo, p: Pos) -> bool {
     *memo.entry(p).or_insert_with(|| standable(w, p))
 }
 
-fn neighbours(w: &dyn BlockView, memo: &mut Memo, p: Pos, out: &mut Vec<(Pos, f64)>) {
+/// Sprint-jump simulations one search may run (each is a few dozen physics ticks): gaps are rare, a search
+/// that meets many of them should not turn into a physics benchmark.
+const GAP_SIMS_PER_SEARCH: u32 = 24;
+/// The longest gap (blocks of missing floor) a planned sprint jump crosses.
+const MAX_GAP: i32 = 3;
+
+fn neighbours(w: &dyn BlockView, memo: &mut Memo, sims: &mut u32, p: Pos, out: &mut Vec<(Pos, f64)>) {
     out.clear();
     let [x, y, z] = p;
-    let here = w.block(x, y, z);
+    let here = w.flags(x, y, z);
     for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
         let diag = dx != 0 && dz != 0;
+        let before = out.len();
         if diag {
             // No cutting corners through blocks.
-            let a = w.block(x + dx, y, z);
-            let b = w.block(x, y, z + dz);
-            let a2 = w.block(x + dx, y + 1, z);
-            let b2 = w.block(x, y + 1, z + dz);
-            if !(a.passable() && b.passable() && a2.passable() && b2.passable()) {
+            let a = w.flags(x + dx, y, z);
+            let b = w.flags(x, y, z + dz);
+            let a2 = w.flags(x + dx, y + 1, z);
+            let b2 = w.flags(x, y + 1, z + dz);
+            if !(a.passable && b.passable && a2.passable && b2.passable) {
                 continue;
             }
         }
         let base = if diag { std::f64::consts::SQRT_2 } else { 1.0 };
         let flat = [x + dx, y, z + dz];
         if stand(w, memo, flat) {
-            let water = w.block(flat[0], flat[1], flat[2]).fluid == Fluid::Water;
+            let water = w.flags(flat[0], flat[1], flat[2]).fluid == Fluid::Water;
             out.push((flat, base + if water { 2.0 } else { 0.0 }));
             continue;
         }
         // Step or jump up one (head room above us too).
         let up = [x + dx, y + 1, z + dz];
-        if !diag && w.block(x, y + 2, z).passable() && stand(w, memo, up) {
+        if !diag && w.flags(x, y + 2, z).passable && stand(w, memo, up) {
             out.push((up, base + 0.6));
             continue;
         }
         // Drop down, up to three blocks (a planned drop, not a bridge).
         for d in 1..=3 {
             let down = [x + dx, y - d, z + dz];
-            if !w.block(x + dx, y - d + 1, z + dz).passable() {
+            if !w.flags(x + dx, y - d + 1, z + dz).passable {
                 break;
             }
             if stand(w, memo, down) {
@@ -116,19 +124,119 @@ fn neighbours(w: &dyn BlockView, memo: &mut Memo, p: Pos, out: &mut Vec<(Pos, f6
                 break;
             }
         }
+        // Nothing to walk, step or drop to that way: a gap a sprint jump may cross.
+        if !diag && out.len() == before && *sims > 0 {
+            if let Some(land) = gap_jump(w, memo, sims, p, dx, dz) {
+                out.push((land.0, land.1));
+            }
+        }
     }
     // Ladders and water: straight up and down.
     if here.climbable || here.fluid == Fluid::Water {
         let up = [x, y + 1, z];
-        if stand(w, memo, up) || w.block(x, y + 1, z).climbable {
+        if stand(w, memo, up) || w.flags(x, y + 1, z).climbable {
             out.push((up, 1.2));
         }
     }
     let down = [x, y - 1, z];
-    let below = w.block(x, y - 1, z);
+    let below = w.flags(x, y - 1, z);
     if (below.climbable || below.fluid == Fluid::Water) && stand(w, memo, down) {
         out.push((down, 1.0));
     }
+}
+
+/// Where a sprint jump from `p` along (dx, dz) lands across 1..=MAX_GAP blocks of missing floor, and what the
+/// edge costs. The landing is verified with the real body physics (a run-up when there are cells to run on
+/// behind `p`), so the search never plans a jump the bot's own physics would not make.
+fn gap_jump(w: &dyn BlockView, memo: &mut Memo, sims: &mut u32, p: Pos, dx: i32, dz: i32) -> Option<(Pos, f64)> {
+    let [x, y, z] = p;
+    // Head room over the cells the jump passes (the jump arc peaks about 1.25 high).
+    let mut clear = 0;
+    for k in 1..=MAX_GAP + 1 {
+        let (cx, cz) = (x + dx * k, z + dz * k);
+        if !(w.flags(cx, y, cz).passable && w.flags(cx, y + 1, cz).passable && w.flags(cx, y + 2, cz).passable) {
+            break;
+        }
+        clear = k;
+    }
+    for n in 1..=MAX_GAP {
+        if clear < n + 1 {
+            break;
+        }
+        let land = [x + dx * (n + 1), y, z + dz * (n + 1)];
+        if !stand(w, memo, land) {
+            continue;
+        }
+        // A run-up: three standable cells behind the take-off.
+        let run = (1..=3).all(|k| stand(w, memo, [x - dx * k, y, z - dz * k]));
+        if *sims == 0 {
+            return None;
+        }
+        *sims -= 1;
+        if jump_lands(w, p, dx, dz, n, run) {
+            return Some((land, (n + 1) as f64 + 3.0));
+        }
+    }
+    None
+}
+
+/// Plays a sprint jump from the middle of `p` along (dx, dz) and says whether it comes down on the far side of
+/// an `n`-block gap at the same height (the body's far edge past the gap's end).
+fn jump_lands(w: &dyn BlockView, p: Pos, dx: i32, dz: i32, n: i32, run: bool) -> bool {
+    use crate::physics::{Body, Input};
+    let dir = Vec3::new(dx as f64, 0.0, dz as f64);
+    let start = Vec3::new(p[0] as f64 + 0.5, p[1] as f64, p[2] as f64 + 0.5);
+    let mut b = Body::new(start);
+    b.yaw = yaw_to(Vec3::ZERO, dir);
+    b.on_ground = true;
+    b.sprinting = true;
+    if run {
+        // Sprinting speed on the ground, about 0.28 blocks a tick.
+        b.vel = dir * 0.28;
+    }
+    let input = Input { forward: 1.0, jump: true, sprint: true, ..Default::default() };
+    let mut airborne = false;
+    for _ in 0..30 {
+        b.tick(&input, w);
+        if !b.on_ground {
+            airborne = true;
+        } else if airborne {
+            let moved = b.pos - start;
+            let along = moved.x * dir.x + moved.z * dir.z;
+            // On the floor again at the take-off height, with the body's front edge over the landing cell.
+            return (b.pos.y - p[1] as f64).abs() < 0.05 && along >= n as f64 + 0.2;
+        }
+        if b.in_water || b.in_lava || b.pos.y < p[1] as f64 - 2.0 {
+            return false;
+        }
+    }
+    false
+}
+
+/// Whether the bot standing in `feet` should jump now for the planned step to `next`: a straight run of two
+/// or more cells along one axis at the same height, with no floor in the very next cell (a gap edge).
+pub fn gap_jump_due(w: &dyn BlockView, feet: Pos, next: Pos) -> bool {
+    let (dx, dz) = (next[0] - feet[0], next[2] - feet[2]);
+    if next[1] != feet[1] || (dx != 0 && dz != 0) || dx.abs().max(dz.abs()) < 2 {
+        return false;
+    }
+    !standable(w, [feet[0] + dx.signum(), feet[1], feet[2] + dz.signum()])
+}
+
+/// Whether the bot at `here` has passed waypoint `a` on its way to `b` (it is beside it going on, or `b` is
+/// nearer) and a straight walk to `b` is clear: `a` can be dropped instead of walked back to. Only for short
+/// same-height legs; steps, drops and gaps keep their exact waypoints.
+pub fn waypoint_passed(w: &dyn BlockView, here: Vec3, a: Pos, b: Pos) -> bool {
+    if a[1] != b[1] || here.block()[1] != a[1] || (b[0] - a[0]).abs().max((b[2] - a[2]).abs()) > 4 {
+        return false;
+    }
+    let (ca, cb) = ((a[0] as f64 + 0.5, a[2] as f64 + 0.5), (b[0] as f64 + 0.5, b[2] as f64 + 0.5));
+    let r = (here.x - ca.0, here.z - ca.1);
+    let dot = r.0 * (cb.0 - ca.0) + r.1 * (cb.1 - ca.1);
+    let da = (r.0 * r.0 + r.1 * r.1).sqrt();
+    let db = ((here.x - cb.0).powi(2) + (here.z - cb.1).powi(2)).sqrt();
+    let passed = (dot > 0.0 && da < 2.0) || (db < da && da < 3.0);
+    passed && straight_walkable(w, here.block(), b)
 }
 
 /// A route from `start` to within `reach` blocks of `goal` (feet positions), at most `budget`
@@ -142,13 +250,39 @@ pub fn find_path_counted(w: &dyn BlockView, start: Pos, goal: Pos, reach: f64, b
     if dist(start, goal) > 160.0 {
         return (None, 0);
     }
-    let mut open = BinaryHeap::new();
-    let mut g: FxMap<Pos, f64> = FxMap::default();
-    let mut from: FxMap<Pos, Pos> = FxMap::default();
-    let mut memo = Memo::default();
+    // The search's maps and heap are kept between calls (a search asks for hundreds of entries each time).
+    let mut sc = SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()));
+    sc.open.clear();
+    sc.g.clear();
+    sc.from.clear();
+    sc.memo.clear();
+    let out = search(w, &mut sc, start, goal, reach, budget);
+    // An unusually big search does not keep its memory.
+    if sc.g.capacity() > 1 << 16 {
+        sc = Scratch::default();
+    }
+    SCRATCH.with(|s| *s.borrow_mut() = sc);
+    out
+}
+
+#[derive(Default)]
+struct Scratch {
+    open: BinaryHeap<Node>,
+    g: FxMap<Pos, f64>,
+    from: FxMap<Pos, Pos>,
+    memo: Memo,
+    nbrs: Vec<(Pos, f64)>,
+}
+
+thread_local! {
+    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
+}
+
+fn search(w: &dyn BlockView, sc: &mut Scratch, start: Pos, goal: Pos, reach: f64, budget: usize) -> (Option<Vec<Pos>>, usize) {
+    let Scratch { open, g, from, memo, nbrs } = sc;
     g.insert(start, 0.0);
     open.push(Node { f: dist(start, goal), p: start });
-    let mut nbrs = Vec::new();
+    let mut sims = GAP_SIMS_PER_SEARCH;
     let mut best = (dist(start, goal), start);
     let mut searched = 0;
     while let Some(Node { p, f }) = open.pop() {
@@ -159,7 +293,7 @@ pub fn find_path_counted(w: &dyn BlockView, start: Pos, goal: Pos, reach: f64, b
         }
         let d = dist(p, goal);
         if d <= reach {
-            return (Some(rebuild(&from, p)), searched);
+            return (Some(rebuild(from, p)), searched);
         }
         if d < best.0 {
             best = (d, p);
@@ -168,8 +302,8 @@ pub fn find_path_counted(w: &dyn BlockView, start: Pos, goal: Pos, reach: f64, b
         if searched > budget {
             break;
         }
-        neighbours(w, &mut memo, p, &mut nbrs);
-        for &(n, c) in &nbrs {
+        neighbours(w, memo, &mut sims, p, nbrs);
+        for &(n, c) in nbrs.iter() {
             let ng = gp + c;
             if g.get(&n).is_none_or(|&old| ng < old - 1e-9) {
                 g.insert(n, ng);
@@ -179,7 +313,7 @@ pub fn find_path_counted(w: &dyn BlockView, start: Pos, goal: Pos, reach: f64, b
         }
     }
     // Out of budget or no way: the route to the closest point reached, if it gets closer.
-    let route = (best.1 != start && best.0 + 1.0 < dist(start, goal)).then(|| rebuild(&from, best.1));
+    let route = (best.1 != start && best.0 + 1.0 < dist(start, goal)).then(|| rebuild(from, best.1));
     (route, searched)
 }
 
@@ -349,6 +483,63 @@ mod tests {
         assert_eq!(*p.last().unwrap(), [2, 65, 0]);
         let back = find_path(&w, [2, 65, 0], [4, 64, 0], 0.5, 500).unwrap();
         assert_eq!(*back.last().unwrap(), [4, 64, 0]);
+    }
+
+    /// A run along z = 0: floor from x = -4 to 1, a gap of `gap` cells, then floor to the end.
+    fn gap_world(gap: i32) -> (MapWorld, i32) {
+        let mut w = MapWorld::default();
+        for x in -4..=1 {
+            w.set(x, 63, 0, "minecraft:stone");
+        }
+        let far = 2 + gap;
+        for x in far..=far + 3 {
+            w.set(x, 63, 0, "minecraft:stone");
+        }
+        (w, far + 3)
+    }
+
+    #[test]
+    fn crosses_a_gap_with_a_sprint_jump() {
+        let (w, end) = gap_world(2);
+        let p = find_path(&w, [0, 64, 0], [end, 64, 0], 0.5, 2000).expect("a route");
+        assert_eq!(*p.last().unwrap(), [end, 64, 0]);
+        assert!(p.windows(2).any(|s| (s[1][0] - s[0][0]).abs() >= 3), "no jump edge in {p:?}");
+        // The bot jumps at the edge cell, not before it.
+        assert!(gap_jump_due(&w, [1, 64, 0], [4, 64, 0]));
+        assert!(!gap_jump_due(&w, [0, 64, 0], [4, 64, 0]));
+        assert!(!gap_jump_due(&w, [0, 64, 0], [1, 64, 0]));
+    }
+
+    #[test]
+    fn a_gap_too_wide_is_not_planned() {
+        let (w, end) = gap_world(7);
+        let p = find_path(&w, [0, 64, 0], [end, 64, 0], 0.5, 2000);
+        assert!(p.is_none_or(|p| *p.last().unwrap() != [end, 64, 0]));
+    }
+
+    #[test]
+    fn a_passed_waypoint_is_dropped() {
+        let w = MapWorld::flat(63);
+        let (a, b) = ([1, 64, 0], [2, 64, 0]);
+        // Beside the waypoint and going on: passed.
+        assert!(waypoint_passed(&w, Vec3::new(1.8, 64.0, 0.5), a, b));
+        // Short of it, the next one farther: not yet.
+        assert!(!waypoint_passed(&w, Vec3::new(0.6, 64.0, 0.5), a, b));
+        // A step up keeps its exact waypoint.
+        assert!(!waypoint_passed(&w, Vec3::new(1.8, 64.0, 0.5), a, [2, 65, 0]));
+        // A wall in the way of the straight walk: not passed.
+        let mut walled = MapWorld::flat(63);
+        walled.set(2, 64, 0, "minecraft:stone");
+        walled.set(2, 65, 0, "minecraft:stone");
+        assert!(!waypoint_passed(&walled, Vec3::new(1.8, 64.0, 0.5), a, b));
+    }
+
+    #[test]
+    fn searches_reuse_their_scratch() {
+        let w = MapWorld::flat(63);
+        let first = find_path(&w, [0, 64, 0], [6, 64, 3], 0.5, 2000).unwrap();
+        let second = find_path(&w, [0, 64, 0], [6, 64, 3], 0.5, 2000).unwrap();
+        assert_eq!(first, second);
     }
 
     #[test]

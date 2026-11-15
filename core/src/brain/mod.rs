@@ -486,6 +486,10 @@ pub struct Bot {
     pub built: VecDeque<u64>,
     /// Target positions seen, for tracking delay: id -> recent positions.
     pub history: BTreeMap<i32, VecDeque<Vec3>>,
+    /// Tick `perceived` last saw each id in `history` (stale entries are dropped, see `perceived`).
+    pub history_seen: BTreeMap<i32, u64>,
+    /// The tick of the brain step in progress (set at its start; `perceived` has no `Perception` of its own).
+    pub now_tick: u64,
     /// The kit it was given (regear target).
     pub kit: Option<String>,
     pub last_mode: &'static str,
@@ -549,6 +553,10 @@ pub const NAV_STARVED_TICKS: u64 = 20;
 pub const NAV_STARVED_BUDGET: usize = 800;
 /// Nodes one search may expand: a first search toward a new goal, and a repeat toward about the same one.
 pub const NAV_FIRST_BUDGET: usize = 2500;
+/// `perceived`: a target not looked at for this many ticks starts a fresh history; one not seen for the
+/// second span is dropped from the maps.
+pub const HISTORY_STALE_TICKS: u64 = 20;
+pub const HISTORY_FORGET_TICKS: u64 = 200;
 pub const NAV_REPEAT_BUDGET: usize = 1000;
 
 impl Bot {
@@ -599,6 +607,8 @@ impl Bot {
             path_failed: false,
             built: VecDeque::new(),
             history: BTreeMap::new(),
+            history_seen: BTreeMap::new(),
+            now_tick: tick,
             kit: None,
             last_mode: "idle",
             last_call: String::new(),
@@ -702,6 +712,20 @@ impl Bot {
     /// Where the bot believes the target is: `tracking` ticks late.
     pub fn perceived(&mut self, t: &Seen) -> Vec3 {
         let delay = ((1.0 - self.settings.knob("tracking")) * 5.0).round() as usize + 1;
+        let now = self.now_tick;
+        // Not looked at for a while (another target in between, out of sight): the old positions are stale
+        // and a new fight must not aim at them.
+        if self.history_seen.get(&t.id).is_some_and(|&last| now > last + HISTORY_STALE_TICKS) {
+            self.history.remove(&t.id);
+        }
+        self.history_seen.insert(t.id, now);
+        if self.history_seen.len() > 8 {
+            // Bound the maps: forget what was not seen for a long time.
+            let keep = |last: &u64| now <= *last + HISTORY_FORGET_TICKS;
+            self.history_seen.retain(|_, last| keep(last));
+            let seen = &self.history_seen;
+            self.history.retain(|id, _| seen.contains_key(id));
+        }
         let h = self.history.entry(t.id).or_default();
         h.push_back(t.pos);
         while h.len() > 12 {
@@ -709,6 +733,12 @@ impl Bot {
         }
         let i = h.len().saturating_sub(delay);
         h.get(i).copied().unwrap_or(t.pos)
+    }
+
+    /// Forgets the tracking history of one target (a new fight starts from where the target is now).
+    pub(crate) fn forget_perceived(&mut self, target_id: i32) {
+        self.history.remove(&target_id);
+        self.history_seen.remove(&target_id);
     }
 
     /// Queues an action behind the simulated ping.
@@ -720,14 +750,15 @@ impl Bot {
     /// Movement toward a point (keys relative to where the bot looks), with pathfinding when the
     /// straight line is blocked.
     pub fn walk_to(&mut self, p: &Perception, d: &mut Decision, goal: Vec3, sprint: bool) {
-        let t_walk = std::time::Instant::now();
+        let t_walk = prof_now();
         self.walk_to_inner(p, d, goal, sprint);
-        prof_add(P_WALK, t_walk.elapsed().as_nanos() as u64);
+        prof_add(P_WALK, prof_ns(t_walk));
     }
 
     fn walk_to_inner(&mut self, p: &Perception, d: &mut Decision, goal: Vec3, sprint: bool) {
         let here = self.body.pos;
         let mut aim_point = goal;
+        let mut gap_jump = false;
         let feet = here.block();
         let goal_b = goal.block();
         let direct = (goal.y - here.y).abs() < 1.2 && {
@@ -739,14 +770,14 @@ impl Bot {
                 {
                     r
                 }
+                // Short range (melee): the same feet block and goal block a tick or two ago give the same answer.
+                Some((f, g, t, r)) if !far && p.tick < t + 3 && f == feet && g == goal_b => r,
                 _ => {
-                    let t_direct = std::time::Instant::now();
+                    let t_direct = prof_now();
                     let r = nav::straight_walkable(p.world, feet, [goal_b[0], feet[1], goal_b[2]]);
-                    prof_add(P_DIRECT, t_direct.elapsed().as_nanos() as u64);
+                    prof_add(P_DIRECT, prof_ns(t_direct));
                     prof_add(P_N_DIRECT, 1);
-                    if far {
-                        self.direct_cache = Some((feet, goal_b, p.tick, r));
-                    }
+                    self.direct_cache = Some((feet, goal_b, p.tick, r));
                     r
                 }
             }
@@ -798,9 +829,9 @@ impl Bot {
                 } else {
                     (if self.path_failed { 800 } else if repeat { NAV_REPEAT_BUDGET } else { NAV_FIRST_BUDGET }).min(self.nav_left)
                 };
-                let t_search = std::time::Instant::now();
+                let t_search = prof_now();
                 let (r, used) = nav::find_path_counted(p.world, feet, goal_b, 1.5, budget);
-                prof_add(P_SEARCH, t_search.elapsed().as_nanos() as u64);
+                prof_add(P_SEARCH, prof_ns(t_search));
                 prof_add(P_N_SEARCH, 1);
                 prof_add(P_N_NODES, used as u64);
                 if starved {
@@ -814,9 +845,9 @@ impl Bot {
                 self.nav_used += used;
                 // Ran the whole (not squeezed) budget and did not arrive: the goal is out of reach or far round.
                 let hopeless = used > budget && budget >= 800;
-                let t_smooth = std::time::Instant::now();
+                let t_smooth = prof_now();
                 let found = r.map(|r| nav::smooth(p.world, &r));
-                prof_add(P_SMOOTH, t_smooth.elapsed().as_nanos() as u64);
+                prof_add(P_SMOOTH, prof_ns(t_smooth));
                 self.path_failed = found.is_none();
                 if found.is_none() {
                     self.search_backoff_until = p.tick + 60;
@@ -841,8 +872,18 @@ impl Bot {
                     break;
                 }
             }
+            // Passed the waypoint (beside it going on, or the one after it is nearer): drop it now instead of
+            // turning back to touch it.
+            if self.path.len() >= 2 && nav::waypoint_passed(p.world, here, self.path[0], self.path[1]) {
+                self.path.remove(0);
+            }
             if let Some(next) = self.path.first() {
                 aim_point = Vec3::new(next[0] as f64 + 0.5, next[1] as f64, next[2] as f64 + 0.5);
+                // A planned sprint-jump over a gap: jump at the edge.
+                if self.body.on_ground && nav::gap_jump_due(p.world, feet, *next) {
+                    d.input.jump = true;
+                    gap_jump = true;
+                }
             }
         } else {
             self.path.clear();
@@ -852,14 +893,28 @@ impl Bot {
         d.input.forward = f;
         d.input.strafe = s;
         let speed = self.settings.f("speed");
-        d.input.sprint = sprint && f > 0.0 && speed >= 1.0;
+        d.input.sprint = (sprint || gap_jump) && f > 0.0 && speed >= 1.0;
         // Jump up a step the walk can't take, or when stuck against something.
         if self.body.horizontal_collision && self.body.on_ground && aim_point.y >= here.y - 0.1 {
             d.input.jump = true;
         }
         if self.stuck_ticks > 12 && self.body.on_ground && here.horizontal_distance(goal) > 1.0 {
             d.input.jump = true;
+            // Build toward the next waypoint (or the goal): bridge, dig soft cover. Nothing happens for a bot whose
+            // settings forbid building, and the building budget and cooldown apply as always. The route is dropped
+            // first (building only works with no path in hand) and searched again afterwards.
+            let toward = self.path.first().map_or(goal, |n| Vec3::new(n[0] as f64 + 0.5, n[1] as f64, n[2] as f64 + 0.5));
             self.path.clear();
+            let extra: Vec<String> = Vec::new();
+            // (Only when the straight way is really blocked: standing still in front of a bot is not being stuck.)
+            if direct || !self.build_if_blocked(p, d, toward, &extra) {
+                // Not building: a sidestep (alternating sides every few ticks) before the next search leads the same way.
+                if self.stuck_ticks <= 24 {
+                    let side = if (self.stuck_ticks / 4) % 2 == 0 { 1.0 } else { -1.0 };
+                    d.input.strafe = side;
+                    d.input.forward = d.input.forward.max(0.0);
+                }
+            }
         }
         // Bunny hops on long straight stretches, each bot on its own rhythm.
         if self.settings.b("bhop") && direct && here.horizontal_distance(goal) > 8.0 && d.input.sprint {
@@ -965,6 +1020,7 @@ impl Bot {
         self.nav_left = squad::NAV_BUDGET_PER_TICK.saturating_sub(squad.nav_spent) as usize;
         self.nav_hard_left = squad::NAV_HARD_CAP_PER_TICK.saturating_sub(squad.nav_spent) as usize;
         self.nav_used = 0;
+        self.now_tick = p.tick;
         prof_add(P_N_BOTS, 1);
         let d = self.tick_inner(p, squad);
         squad.nav_spent = squad.nav_spent.saturating_add(self.nav_used as u32);
@@ -985,7 +1041,7 @@ impl Bot {
         }
         self.stuck_ticks = if self.body.pos.horizontal_distance(self.last_pos) < 0.02 { self.stuck_ticks + 1 } else { 0 };
         self.last_pos = self.body.pos;
-        let mut t = std::time::Instant::now();
+        let mut t = prof_now();
         self.take_events(p);
         lap(&mut t, P_EVENTS);
         if self.orders.paused || self.ghost {
@@ -1020,10 +1076,10 @@ impl Bot {
         survival::auto_equip(self, p, &mut d);
         lap(&mut t, P_SURV);
 
-        let t_target = std::time::Instant::now();
+        let t_target = prof_now();
         let target = combat::choose_target(self, p, squad);
-        prof_add(P_TARGET, t_target.elapsed().as_nanos() as u64);
-        t = std::time::Instant::now();
+        prof_add(P_TARGET, prof_ns(t_target));
+        t = prof_now();
         if survival::heal(self, p, &mut d, target.as_ref()) {
             lap(&mut t, P_HEAL);
             return self.finish(p, d);
@@ -1149,7 +1205,7 @@ impl Bot {
     /// Runs the physics with the decided keys and releases actions whose ping has passed.
     fn finish(&mut self, p: &Perception, mut d: Decision) -> Decision {
         let tick = p.tick;
-        let t_finish = std::time::Instant::now();
+        let t_finish = prof_now();
         // Hiding without a potion: crouched the whole time.
         if self.orders.hide && !self.hidden_with_potion && !matches!(d.mode, "fight") {
             d.input.sneak = true;
@@ -1177,9 +1233,9 @@ impl Bot {
             d.input.forward *= 0.2;
             d.input.strafe *= 0.2;
         }
-        let t_body = std::time::Instant::now();
+        let t_body = prof_now();
         self.body.tick(&d.input, p.world);
-        prof_add(P_BODY, t_body.elapsed().as_nanos() as u64);
+        prof_add(P_BODY, prof_ns(t_body));
         let mut late = Vec::new();
         while self.outbox.front().is_some_and(|(due, _)| *due <= tick) {
             late.push(self.outbox.pop_front().unwrap().1);
@@ -1187,7 +1243,7 @@ impl Bot {
         // Delayed attacks go out after this tick's slot changes.
         d.actions.extend(late);
         self.last_mode = d.mode;
-        prof_add(P_FINISH, t_finish.elapsed().as_nanos() as u64);
+        prof_add(P_FINISH, prof_ns(t_finish));
         d
     }
 }
@@ -1259,9 +1315,36 @@ const PROF_NAMES: [&str; PROF_LEN] = [
     "horizonbot_act_us",
 ];
 
+/// Whether the sections above are timed and counted. Off by default: the ~20 clock reads per bot-tick were a
+/// measurable cost; the glue (or a debug command) turns it on with `set_profiling(true)` when someone profiles.
+pub static PROFILE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+pub fn profiling() -> bool {
+    PROFILE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_profiling(on: bool) {
+    PROFILE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A clock reading for a section, or None while profiling is off.
+#[inline]
+pub fn prof_now() -> Option<std::time::Instant> {
+    profiling().then(std::time::Instant::now)
+}
+
+/// Nanoseconds since a `prof_now` reading (0 when profiling is off).
+#[inline]
+pub fn prof_ns(t: Option<std::time::Instant>) -> u64 {
+    t.map_or(0, |t| t.elapsed().as_nanos() as u64)
+}
+
 #[inline]
 pub fn prof_add(i: usize, v: u64) {
-    PROF_NS[i].fetch_add(v, std::sync::atomic::Ordering::Relaxed);
+    if profiling() {
+        PROF_NS[i].fetch_add(v, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Everything counted since the last call, reset: nanosecond sections in microseconds (`_us`), counts as they are.
@@ -1276,10 +1359,12 @@ pub fn prof_take() -> Vec<(&'static str, u64)> {
 
 /// Adds the time since `*t` to section `i` and restarts the lap.
 #[inline]
-fn lap(t: &mut std::time::Instant, i: usize) {
-    let now = std::time::Instant::now();
-    prof_add(i, now.duration_since(*t).as_nanos() as u64);
-    *t = now;
+fn lap(t: &mut Option<std::time::Instant>, i: usize) {
+    if let Some(from) = *t {
+        let now = std::time::Instant::now();
+        prof_add(i, now.duration_since(from).as_nanos() as u64);
+        *t = Some(now);
+    }
 }
 
 pub fn effect_level(me: &SelfView, id: &str) -> u32 {
